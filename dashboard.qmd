@@ -1,0 +1,324 @@
+```{python}
+#Import Libraries
+
+import polars as pl
+import pandas as pd
+import streamlit as st
+import numpy as np
+import xlsx2csv
+from lets_plot import *
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import classification_report, accuracy_score
+```
+
+
+```{python}
+epds = pl.read_csv('2025Bull.csv', ignore_errors=True).with_row_index().drop(['Sex', 'DOB','BrdCds'])
+
+epds = epds.with_columns(mean = pl.sum_horizontal(['HB','GM']) / 2)
+
+
+epds = (epds.with_columns([
+    pl.col("AnimalID").str.split_exact(" - ", 1).
+    alias("split_column")]).
+    with_columns(pl.col('split_column')).
+    unnest('split_column').
+    rename({'field_0' : 'cow', 'field_1' : 'bull'})
+)
+
+criteria = {
+    "ME": -1,
+    "CED": 12,
+    "Milk": 26,
+    "CEM": 7,
+    "Marb": 0.4,
+    "STAY": 17
+}
+
+epds_mins = epds.filter(
+    (pl.col("ME") <= criteria["ME"]) &
+    (pl.col("CED") >= criteria["CED"]) &
+    (pl.col("Milk") >= criteria["Milk"]) &
+    (pl.col("CEM") >= criteria["CEM"]) &
+    (pl.col("Marb") >= criteria["Marb"]) &
+    (pl.col("STAY") >= criteria["STAY"])
+)
+
+mean_hb = epds.select(pl.mean('HB'))
+mean_milk = epds.select(pl.mean('STAY'))
+mean_gm = epds.select(pl.mean('GM'))
+
+max_gm_epds = epds.group_by("cow").agg([
+    pl.col("GM").max().alias("GM")
+]).join(epds, on=["cow", "GM"])
+
+max_hg_epds = epds.group_by("cow").agg([
+    pl.col("HB").max().alias("HB")
+]).join(epds, on=["cow", "HB"])
+```
+
+6 cows who cannot meet milk requirement at all:C29, D10, G07, H15, H11, H59 
+
+4 cows cannot meet marb requirements at all: C44, F83, F03, C32
+
+17 other cows that cannot meet the requirements in conjuction
+
+```{python}
+
+#epds.select(pl.col('cow').n_unique()).item()
+epds_mins.select(pl.col('cow').n_unique()).item()
+
+```
+
+```{python}
+cows = epds.select(pl.col('cow').unique()).to_series().to_list()
+
+cows_meeting_requirements = epds_mins.select(pl.col('cow').unique()).to_series().to_list()
+
+# Compare the lists
+cows_in_both = set(cows).intersection(cows_meeting_requirements)
+
+cows_only_in_original = set(cows) - set(cows_meeting_requirements)
+
+```
+
+```{python}
+
+cows_failing = (epds.filter(pl.col("cow").is_in(cows_only_in_original)))
+
+max_hg = cows_failing.group_by("cow").agg([
+    pl.col("HB").max().alias("HB")
+]).join(cows_failing, on=["cow", "HB"])
+
+max_gm = cows_failing.group_by("cow").agg([
+    pl.col("GM").max().alias("GM")
+]).join(cows_failing, on=["cow", "GM"])
+
+```
+
+```{python}
+max_rea_by_cow = epds_mins.group_by("cow").agg(
+    [pl.all().first(), pl.col("REA").max().alias("max_REA")]
+)
+
+
+max_cw_by_cow = epds_mins.group_by("cow").agg(
+    [pl.all().first(), pl.col("CW").max().alias("max_cw")]
+)
+
+min_yg_by_cow = epds_mins.group_by("cow").agg(
+    [pl.all().first(), pl.col("YG").min().alias("min_yg")]
+)
+
+```
+
+
+
+```{python}
+mean_by_cow = epds.group_by("cow").agg([
+    pl.col("HB").mean().alias("mean_hb"),
+    pl.col("GM").mean().alias("mean_gm")
+])
+
+comparison = mean_by_cow.with_columns([
+    pl.when((pl.col("mean_hb") > mean_hb) & (pl.col("mean_gm") > mean_gm))
+      .then(pl.lit("both"))
+      .when(pl.col("mean_hb") > mean_hb)
+      .then(pl.lit("HB"))
+      .when(pl.col("mean_gm") > mean_gm)
+      .then(pl.lit("GM"))
+      .otherwise(pl.lit("none"))
+      .alias("comparison_result")
+])
+
+mean_by_bull = epds.group_by("bull").agg([
+    pl.col("HB").mean().alias("mean_hb"),
+    pl.col("GM").mean().alias("mean_gm")
+])
+
+comparison_bull = mean_by_bull.with_columns([
+    pl.when((pl.col("mean_hb") > mean_hb) & (pl.col("mean_gm") > mean_gm))
+      .then(pl.lit("both"))
+      .when(pl.col("mean_hb") > mean_hb)
+      .then(pl.lit("HB"))
+      .when(pl.col("mean_gm") > mean_gm)
+      .then(pl.lit("GM"))
+      .otherwise(pl.lit("none"))
+      .alias("comparison_result")
+])
+```
+
+```{python}
+mean_by_failing_cow = cows_failing.group_by("cow").agg([
+    pl.col("HB").mean().alias("mean_hb"),
+    pl.col("GM").mean().alias("mean_gm")
+])
+
+comparison_failing = mean_by_failing_cow.with_columns([
+    pl.when((pl.col("mean_hb") > mean_hb) & (pl.col("mean_gm") > mean_gm))
+      .then(pl.lit("both"))
+      .when(pl.col("mean_hb") > mean_hb)
+      .then(pl.lit("HB"))
+      .when(pl.col("mean_gm") > mean_gm)
+      .then(pl.lit("GM"))
+      .otherwise(pl.lit("none"))
+      .alias("comparison_result")
+])
+
+
+```
+
+
+```{python}
+epds_with_target = epds.with_columns(((pl.col('HB') + pl.col('GM')) / 2).alias('target'))
+
+```
+
+
+```{python}
+
+# Calculate the mean of the 'target' column
+mean_target = epds_with_target.select(pl.mean('target')).item()
+
+# Add the new column 'comparison' based on the mean of the 'target' column
+epds_with_target = epds_with_target.with_columns(
+    pl.when(pl.col('target') > mean_target)
+    .then(pl.lit("above"))
+    .otherwise(pl.lit("below"))
+    .alias('comparison')
+)
+
+# Calculate the mean of the 'target' column
+mean_hb = epds_with_target.select(pl.mean('HB')).item()
+
+# Add the new column 'comparison' based on the mean of the 'target' column
+epds_with_target = epds_with_target.with_columns(
+    pl.when(pl.col('HB') > mean_hb)
+    .then(pl.lit("above"))
+    .otherwise(pl.lit("below"))
+    .alias('comparison_hb')
+)
+
+# Calculate the mean of the 'target' column
+mean_gm = epds_with_target.select(pl.mean('GM')).item()
+
+# Add the new column 'comparison' based on the mean of the 'target' column
+epds_with_target = epds_with_target.with_columns(
+    pl.when(pl.col('GM') > mean_gm)
+    .then(pl.lit("above"))
+    .otherwise(pl.lit("below"))
+    .alias('comparison_gm')
+)
+df = epds
+```
+
+
+```{python}
+#Model Creation
+
+def judge(row):
+    if row['comparison'] == 'above':
+        return row['target']
+    elif row['comparison_hb'] == 'above':
+        return row['HB']
+    elif row['comparison_gm'] == 'above':
+        return row['GM']
+    else:
+        return max(row['target'], row['HB'], row['GM'])
+
+```
+
+```{python}
+# Define maximum number of bulls for breeding 
+
+bull_limit = len(df['cow'].unique()) // 5
+
+prob = LpProblem("Breeding_Optimization", LpMaximize)
+
+vars = pl.DataFrame({
+    'cow': df['cow'],
+    'bull': df['bull'],
+    'Variable': [LpVariable(f"x_{i}_{j}", cat=LpBinary) for i in range(len(df)) for j in range(len(df['bull'].unique()))]
+})
+```
+
+```{python}
+from pulp import LpProblem, LpVariable, LpMaximize, lpSum, LpBinary
+
+# Define constraints
+bull_limit = len(epds_with_target['cow'].unique()) // 5
+
+# Initialize the problem
+prob = LpProblem("Breeding_Optimization", LpMaximize)
+
+# Create decision variables
+n = len(epds_with_target)
+bulls = epds_with_target['bull'].unique()
+vars = {
+    (i, j): LpVariable(f"x_{i}_{j}", cat=LpBinary)
+    for i in range(n)
+    for j in range(len(bulls))
+}
+
+# Objective function: Maximize total target based on 'above' or 'below'
+prob += lpSum(
+    vars[i, j] * epds_with_target['target'][i]
+    for i in range(n)
+    for j in range(len(bulls))
+    if epds_with_target['comparison'][i] == 'above'
+)
+
+# Add constraints: Each bull can breed with at most 1/5 of the cows
+for bull in bulls:
+    prob += lpSum(
+        vars[i, j]
+        for i in range(n)
+        if epds_with_target['bull'][i] == bull
+        for j in range(len(bulls))
+    ) <= bull_limit
+
+# Constraints: Each cow breeds only once
+for cow in epds_with_target['cow'].unique():
+    prob += lpSum(
+        vars[i, j]
+        for i in range(n)
+        if epds_with_target['cow'][i] == cow
+        for j in range(len(bulls))
+    ) == 1
+
+# Solve the problem
+prob.solve()
+
+# Extract the results
+result = []
+for i in range(n):
+    for j in range(len(bulls)):
+        if vars[i, j].varValue == 1:
+            result.append((epds_with_target['cow'][i], epds_with_target['bull'][j]))
+
+result = pl.DataFrame(result)
+
+```
+
+```{python}
+result = result.transpose()
+result = result.rename({
+    result.columns[0]: "cow",
+    result.columns[1]: "bull"
+})
+
+```
+
+```{python}
+result.write_csv("result.csv", separator= ",")
+```
+
+```{python}
+bull_counts = result.group_by("bull").agg(
+    pl.len().alias("count")
+).sort("count", descending=True)
+
+bull_counts
+```
