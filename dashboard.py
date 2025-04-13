@@ -59,10 +59,14 @@ page = st.sidebar.radio("Select a page:", [
 
 # Function to load data
 @st.cache_data
-def load_data():
+def load_data(uploaded_file=None):
     try:
-        # Try to load the data
-        epds = pl.read_csv('2025Bull.csv', ignore_errors=True).with_row_index().drop(['Sex', 'DOB', 'BrdCds'])
+        # If a file was uploaded, use that data directly
+        if uploaded_file is not None:
+            epds = pl.read_csv(uploaded_file, ignore_errors=True).with_row_index().drop(['Sex', 'DOB', 'BrdCds'], errors="ignore")
+        else:
+            # Try to load data from file
+            epds = pl.read_csv('2025planned_mating.csv', ignore_errors=True).with_row_index().drop(['Sex', 'DOB', 'BrdCds'], errors="ignore")
         
         # Process data similar to the original code
         epds = epds.with_columns(mean=pl.sum_horizontal(['HB', 'GM']) / 2)
@@ -109,6 +113,7 @@ def load_data():
         st.error(f"Error loading data: {e}")
         # Return sample data if actual data can't be loaded
         return generate_sample_data()
+
 
 def generate_sample_data():
     """Generate sample data if the real data file is not available"""
@@ -176,14 +181,17 @@ def generate_sample_data():
 # Allow uploading a file
 uploaded_file = st.sidebar.file_uploader("Upload your bull data (CSV)", type="csv")
 if uploaded_file is not None:
-    # Save the uploaded file
-    with open("2025Bull.csv", "wb") as f:
-        f.write(uploaded_file.getbuffer())
     st.sidebar.success("File uploaded successfully!")
-
-# Load the data
-_df = load_data()
-
+    
+    # Force reload data when a new file is uploaded
+    st.cache_data.clear()
+    
+    # Load data directly from the uploaded file
+    _df = load_data(uploaded_file)
+    st.sidebar.info("Data loaded from uploaded file")
+else:
+    st.sidebar.info("No file uploaded. Using default or sample data.")
+    _df = load_data()
 # Define the criteria similar to your original code
 default_criteria = {
     "ME": -1.0,  # Convert to float
