@@ -9,7 +9,7 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import classification_report, accuracy_score
 import plotly.express as px
 import plotly.graph_objects as go
-from pulp import LpProblem, LpVariable, LpMaximize, lpSum
+from pulp import LpProblem, LpVariable, LpMaximize, lpSum, LpBinary
 
 # Set page config
 st.set_page_config(
@@ -236,78 +236,208 @@ stats_filtered = calculate_stats(_df_filtered)
 
 # Run the optimization
 @st.cache_data
-def run_optimization(_epds_with_target):
+def run_optimization(_epds_with_target, target_values=None):
+    """
+    Optimize breeding pairs based on target values for various traits.
+    
+    Parameters:
+    _epds_with_target - DataFrame with cow/bull pairs and their traits
+    target_values - Dictionary with target values for each trait
+    """
     try:
-        # Define constraints
-        bull_limit = len(_epds_with_target['cow'].unique()) // 5
-
-        # Initialize the problem
-        prob = LpProblem("Breeding_Optimization", LpMaximize)
-
-        # Create decision variables
-        n = len(_epds_with_target)
-        bulls = _epds_with_target['bull'].unique().to_list()
-        vars = {
-            (i, j): LpVariable(f"x_{i}_{j}", cat=LPBinary)
-            for i in range(n)
-            for j in range(len(bulls))
-        }
-
-        # Objective function: Maximize total target based on 'above' or 'below'
-        prob += lpSum(
-            vars[i, j] * _epds_with_target['target'][i]
-            for i in range(n)
-            for j in range(len(bulls))
-            if _epds_with_target['comparison'][i] == 'above'
-        )
-
-        # Add constraints: Each bull can breed with at most 1/5 of the cows
-        for bull_idx, bull in enumerate(bulls):
-            prob += lpSum(
-                vars[i, bull_idx]
-                for i in range(n)
-                if _epds_with_target['bull'][i] == bull
-            ) <= bull_limit
-
-        # Constraints: Each cow breeds only once
-        cows = _epds_with_target['cow'].unique().to_list()
-        for cow_idx, cow in enumerate(cows):
-            prob += lpSum(
-                vars[i, j]
-                for i in range(n)
-                if _epds_with_target['cow'][i] == cow
-                for j in range(len(bulls))
-            ) <= 1
-
-        # Solve the problem
-        prob.solve()
-
-        # Extract the results
-        result = []
-        for i in range(n):
-            for j in range(len(bulls)):
-                if vars[i, j].value() == 1:
-                    result.append({
-                        "cow": _epds_with_target['cow'][i], 
-                        "bull": bulls[j]
-                    })
-
-        if not result:
-            return None
-            
-        result__df = pl.DataFrame(result)
+        # Default target values if not provided
+        if target_values is None:
+            target_values = {
+                'CED': 14, 'BW': -3, 'WW': 65, 'YW': 100, 'ADG': 0.28,
+                'DMI': 0.6, 'Milk': 29, 'ME': -2, 'HPG': 12, 'CEM': 8,
+                'STAY': 18, 'Marb': 0.5, 'YG': 0.03, 'CW': 29, 'REA': 0.17,
+                'FAT': 0, 'HB': 70, 'GM': 46
+            }
         
-        # Count bulls
-        bull_counts = result__df.group_by("bull").agg(
-            pl.len().alias("count")
+        # Define metrics where lower values are better
+        lower_is_better = ['DMI', 'BW', 'ME', 'YG', 'FAT']
+        
+        # Get unique cows and bulls
+        cows = _epds_with_target['cow'].unique().to_list()
+        bulls = _epds_with_target['bull'].unique().to_list()
+        
+        # Calculate the bull limit (1/5 of the unique cows)
+        bull_limit = max(1, len(cows) // 5)
+        
+        # Identify all metrics to use in optimization
+        all_metrics = ['CED', 'BW', 'WW', 'YW', 'ADG', 'DMI', 'Milk', 'ME', 'HPG', 
+                      'CEM', 'STAY', 'Marb', 'YG', 'CW', 'REA', 'FAT', 'HB', 'GM']
+        
+        # Filter to only metrics present in the data
+        available_metrics = [m for m in all_metrics if m in _epds_with_target.columns]
+        
+        # Calculate standard deviations for normalization
+        std_values = {}
+        for metric in available_metrics:
+            std_values[metric] = max(_epds_with_target.select(pl.std(metric)).item(), 0.0001)
+        
+        # Calculate a score for each pairing based on closeness to target values
+        pairing_scores = []
+        
+        for i in range(len(_epds_with_target)):
+            row = _epds_with_target.row(i)
+            cow = row[_epds_with_target.columns.index('cow')]
+            bull = row[_epds_with_target.columns.index('bull')]
+            
+            # Calculate standardized distance from target for each metric
+            metric_scores = {}
+            total_score = 0
+            better_than_target_count = 0
+            
+            for metric in available_metrics:
+                if metric in _epds_with_target.columns:
+                    metric_idx = _epds_with_target.columns.index(metric)
+                    metric_value = row[metric_idx]
+                    target = target_values.get(metric, 0)
+                    
+                    # Calculate z-score differently based on whether lower or higher is better
+                    if metric in lower_is_better:
+                        # For metrics where lower is better, a negative z-score is good
+                        z_score = (target - metric_value) / std_values[metric]
+                        is_better = metric_value <= target
+                    else:
+                        # For metrics where higher is better, a positive z-score is good
+                        z_score = (metric_value - target) / std_values[metric]
+                        is_better = metric_value >= target
+                    
+                    # Only count positive contributions (better than target)
+                    if is_better:
+                        better_than_target_count += 1
+                        total_score += max(0, z_score)  # Only use positive score
+                    
+                    metric_scores[metric] = {
+                        'value': metric_value,
+                        'target': target,
+                        'z_score': z_score,
+                        'is_better': is_better
+                    }
+            
+            # Store all the information for this pairing
+            pairing_scores.append({
+                'index': i,
+                'cow': cow,
+                'bull': bull,
+                'better_than_target_count': better_than_target_count,
+                'total_score': total_score,
+                'metrics': metric_scores
+            })
+        
+        # Function to solve the optimization with a given set of excluded pairings
+        def solve_with_exclusions(excluded_pairings=None):
+            from pulp import LpProblem, LpMaximize, LpVariable, LpBinary, lpSum
+            
+            # Initialize the optimization problem
+            prob = LpProblem("Breeding_Optimization", LpMaximize)
+            
+            # Create decision variables
+            n = len(_epds_with_target)
+            vars = {
+                i: LpVariable(f"x_{i}", cat=LpBinary)
+                for i in range(n)
+            }
+            
+            # Objective function: Maximize the combined score
+            # Weight both the count of metrics better than target and the total score
+            prob += lpSum(
+                vars[i] * (3 * pairing_scores[i]['better_than_target_count'] + pairing_scores[i]['total_score'])
+                for i in range(n)
+            )
+            
+            # Constraint: Each cow breeds only once
+            for cow in cows:
+                prob += lpSum(
+                    vars[i]
+                    for i in range(n)
+                    if pairing_scores[i]['cow'] == cow
+                ) <= 1
+            
+            # Constraint: Each bull can breed with at most bull_limit cows
+            for bull in bulls:
+                prob += lpSum(
+                    vars[i]
+                    for i in range(n)
+                    if pairing_scores[i]['bull'] == bull
+                ) <= bull_limit
+            
+            # Add exclusion constraints if any
+            if excluded_pairings:
+                # Force at least one pairing to be different
+                prob += lpSum(
+                    vars[i] for i in excluded_pairings
+                ) <= len(excluded_pairings) - 1
+            
+            # Solve the problem
+            prob.solve()
+            
+            # Extract the results
+            result = []
+            selected_indices = []
+            for i in range(n):
+                if vars[i].value() == 1:  # If this pairing is selected
+                    selected_pair = {
+                        "cow": pairing_scores[i]['cow'],
+                        "bull": pairing_scores[i]['bull'],
+                        "better_than_target_count": pairing_scores[i]['better_than_target_count'],
+                        "total_score": round(pairing_scores[i]['total_score'], 2)
+                    }
+                    
+                    # Include individual metric values in the result
+                    for metric in available_metrics:
+                        if metric in pairing_scores[i]['metrics']:
+                            selected_pair[metric] = pairing_scores[i]['metrics'][metric]['value']
+                    
+                    result.append(selected_pair)
+                    selected_indices.append(i)
+            
+            return result, selected_indices
+            
+        # Generate the initial solution
+        primary_solution, primary_indices = solve_with_exclusions()
+        
+        # Generate a secondary solution by excluding the primary solution
+        secondary_solution, secondary_indices = solve_with_exclusions(primary_indices)
+        
+        # Convert solutions to DataFrames
+        primary_pairings = pl.DataFrame(primary_solution)
+        
+        # Count bulls in primary solution
+        primary_bull_counts = primary_pairings.group_by("bull").agg(
+            pl.count().alias("count")
         ).sort("count", descending=True)
         
+        # Do the same for secondary solution
+        if secondary_solution:
+            secondary_pairings = pl.DataFrame(secondary_solution)
+            secondary_bull_counts = secondary_pairings.group_by("bull").agg(
+                pl.count().alias("count")
+            ).sort("count", descending=True)
+        else:
+            secondary_pairings = None
+            secondary_bull_counts = None
+        
         return {
-            "pairings": result__df,
-            "bull_counts": bull_counts
+            "primary_pairings": primary_pairings,
+            "primary_bull_counts": primary_bull_counts,
+            "secondary_pairings": secondary_pairings,
+            "secondary_bull_counts": secondary_bull_counts,
+            "selected_indices": primary_indices,
+            "pairing_scores": pairing_scores,
+            "available_metrics": available_metrics,
+            "target_values": target_values,
+            "total_cows": len(cows),
+            "total_bulls": len(bulls),
+            "bull_limit": bull_limit
         }
+        
     except Exception as e:
+        import traceback
         st.error(f"Optimization error: {e}")
+        st.error(traceback.format_exc())
         return None
 
 # Apply pages based on selection
@@ -566,32 +696,61 @@ elif page == "Optimization Results":
         optimization_results = run_optimization(_df_filtered)
     
     if optimization_results:
-        # Show results
-        st.markdown("##### Optimal Breeding Pairs")
-        st.dataframe(optimization_results["pairings"], use_container_width=True)
+        # Create tabs for primary and secondary solutions
+        primary_tab, secondary_tab = st.tabs(["Primary Solution", "Secondary Solution"])
         
-        # Show bull distribution
-        st.markdown("##### Bull Usage in Optimal Solution")
-        st.dataframe(optimization_results["bull_counts"], use_container_width=True)
+        with primary_tab:
+            st.markdown("##### Optimal Breeding Pairs (Primary Solution)")
+            st.dataframe(optimization_results["primary_pairings"], use_container_width=True)
+            
+            # Show bull distribution
+            st.markdown("##### Bull Usage in Primary Solution")
+            st.dataframe(optimization_results["primary_bull_counts"], use_container_width=True)
+            
+            # Visualize bull usage
+            fig = px.bar(optimization_results["primary_bull_counts"].to_pandas(), 
+                         x="bull", y="count", 
+                         title="Bull Usage Count in Primary Solution",
+                         color_discrete_sequence=['#9b59b6'])
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Download results
+            csv = optimization_results["primary_pairings"].to_pandas().to_csv(index=False)
+            st.download_button(
+                label="Download Primary Solution Breeding Pairs",
+                data=csv,
+                file_name="primary_optimal_breeding_pairs.csv",
+                mime="text/csv",
+            )
         
-        # Visualize bull usage
-        fig = px.bar(optimization_results["bull_counts"].to_pandas(), 
-                     x="bull", y="count", 
-                     title="Bull Usage Count in Optimal Solution",
-                     color_discrete_sequence=['#9b59b6'])
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # Download results
-        csv = optimization_results["pairings"].to_pandas().to_csv(index=False)
-        st.download_button(
-            label="Download Optimal Breeding Pairs",
-            data=csv,
-            file_name="optimal_breeding_pairs.csv",
-            mime="text/csv",
-        )
+        with secondary_tab:
+            if optimization_results["secondary_pairings"] is not None:
+                st.markdown("##### Optimal Breeding Pairs (Secondary Solution)")
+                st.dataframe(optimization_results["secondary_pairings"], use_container_width=True)
+                
+                # Show bull distribution
+                st.markdown("##### Bull Usage in Secondary Solution")
+                st.dataframe(optimization_results["secondary_bull_counts"], use_container_width=True)
+                
+                # Visualize bull usage
+                fig = px.bar(optimization_results["secondary_bull_counts"].to_pandas(), 
+                             x="bull", y="count", 
+                             title="Bull Usage Count in Secondary Solution",
+                             color_discrete_sequence=['#e67e22'])
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # Download results
+                csv = optimization_results["secondary_pairings"].to_pandas().to_csv(index=False)
+                st.download_button(
+                    label="Download Secondary Solution Breeding Pairs",
+                    data=csv,
+                    file_name="secondary_optimal_breeding_pairs.csv",
+                    mime="text/csv",
+                )
+            else:
+                st.warning("Could not find a distinct secondary solution. The primary solution may be the only feasible option with the current criteria.")
     else:
         st.warning("Could not find an optimal solution with the current criteria. Try adjusting your criteria.")
-
 # Footer
 st.markdown("---")
 st.markdown("Bull Breeding Analysis Dashboard | Created with Streamlit")
