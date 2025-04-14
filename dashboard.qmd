@@ -322,3 +322,491 @@ bull_counts = result.group_by("bull").agg(
 
 bull_counts
 ```
+
+```{python}
+#pulp options
+@st.cache_data
+def run_optimization(_epds_with_target):
+    try:
+        # Get unique cows and bulls
+        cows = _epds_with_target['cow'].unique().to_list()
+        bulls = _epds_with_target['bull'].unique().to_list()
+        
+        # Calculate the bull limit (1/5 of the unique cows)
+        bull_limit = len(cows) // 5
+        
+        # Calculate means for relevant metrics
+        mean_values = {
+            'HB': _epds_with_target.select(pl.mean('HB')).item(),
+            'GM': _epds_with_target.select(pl.mean('GM')).item(),
+            'target': _epds_with_target.select(pl.mean('target')).item(),
+            'ME': _epds_with_target.select(pl.mean('ME')).item(),
+            'CED': _epds_with_target.select(pl.mean('CED')).item(),
+            'Milk': _epds_with_target.select(pl.mean('Milk')).item(),
+            'CEM': _epds_with_target.select(pl.mean('CEM')).item(),
+            'Marb': _epds_with_target.select(pl.mean('Marb')).item(),
+            'STAY': _epds_with_target.select(pl.mean('STAY')).item()
+        }
+        
+        # Prepare data for optimization
+        pairing_data = []
+        for i in range(len(_epds_with_target)):
+            row = _epds_with_target.row(i)
+            cow = row[_epds_with_target.columns.index('cow')]
+            bull = row[_epds_with_target.columns.index('bull')]
+            
+            # Count metrics where this pairing exceeds the mean
+            above_mean_count = 0
+            for metric in ['HB', 'GM', 'target', 'CED', 'Milk', 'CEM', 'Marb', 'STAY']:
+                metric_idx = _epds_with_target.columns.index(metric)
+                metric_value = row[metric_idx]
+                
+                # For ME, lower is better so we check if it's below mean
+                if metric == 'ME':
+                    if row[_epds_with_target.columns.index('ME')] < mean_values['ME']:
+                        above_mean_count += 1
+                # For others, higher is better
+                elif metric_value > mean_values[metric]:
+                    above_mean_count += 1
+            
+            pairing_data.append({
+                'index': i,
+                'cow': cow,
+                'bull': bull,
+                'above_mean_count': above_mean_count
+            })
+        
+        # Initialize the optimization problem
+        prob = LpProblem("Breeding_Optimization", LpMaximize)
+        
+        # Create decision variables (binary variables for each pairing)
+        vars = {
+            i: LpVariable(f"x_{i}", cat=LpBinary)
+            for i in range(len(pairing_data))
+        }
+        
+        # Objective function: Maximize the number of metrics above mean across all selected pairings
+        prob += lpSum(
+            vars[i] * pairing_data[i]['above_mean_count']
+            for i in range(len(pairing_data))
+        )
+        
+        # Constraint: Each cow breeds only once
+        for cow in cows:
+            prob += lpSum(
+                vars[i]
+                for i in range(len(pairing_data))
+                if pairing_data[i]['cow'] == cow
+            ) <= 1
+        
+        # Constraint: Each bull can breed with at most bull_limit cows
+        for bull in bulls:
+            prob += lpSum(
+                vars[i]
+                for i in range(len(pairing_data))
+                if pairing_data[i]['bull'] == bull
+            ) <= bull_limit
+        
+        # Solve the problem
+        prob.solve()
+        
+        # Extract the results
+        result = []
+        for i in range(len(pairing_data)):
+            if vars[i].value() == 1:  # If this pairing is selected
+                result.append({
+                    "cow": pairing_data[i]['cow'],
+                    "bull": pairing_data[i]['bull'],
+                    "above_mean_metrics": pairing_data[i]['above_mean_count']
+                })
+        
+        if not result:
+            return None
+            
+        result_df = pl.DataFrame(result)
+        
+        # Count bulls
+        bull_counts = result_df.group_by("bull").agg(
+            pl.len().alias("count")
+        ).sort("count", descending=True)
+        
+        return {
+            "pairings": result_df,
+            "bull_counts": bull_counts
+        }
+    except Exception as e:
+        st.error(f"Optimization error: {e}")
+        return None
+
+
+
+# Option 2
+
+@st.cache_data
+def run_optimization(_epds_with_target):
+    try:
+        # Define constraints
+        bull_limit = len(_epds_with_target['cow'].unique()) // 5
+
+        # Initialize the problem
+        prob = LpProblem("Breeding_Optimization", LpMaximize)
+
+        # Create decision variables
+        n = len(_epds_with_target)
+        bulls = _epds_with_target['bull'].unique().to_list()
+        vars = {
+            (i, j): LpVariable(f"x_{i}_{j}", cat=LpBinary)
+            for i in range(n)
+            for j in range(len(bulls))
+        }
+
+        # Objective function: Maximize total target based on 'above' or 'below'
+        prob += lpSum(
+            vars[i, j] * _epds_with_target['target'][i]
+            for i in range(n)
+            for j in range(len(bulls))
+            if _epds_with_target['comparison'][i] == 'above'
+        )
+
+        # Add constraints: Each bull can breed with at most 1/5 of the cows
+        for bull_idx, bull in enumerate(bulls):
+            prob += lpSum(
+                vars[i, bull_idx]
+                for i in range(n)
+                if _epds_with_target['bull'][i] == bull
+            ) <= bull_limit
+
+        # Constraints: Each cow breeds only once
+        cows = _epds_with_target['cow'].unique().to_list()
+        for cow_idx, cow in enumerate(cows):
+            prob += lpSum(
+                vars[i, j]
+                for i in range(n)
+                if _epds_with_target['cow'][i] == cow
+                for j in range(len(bulls))
+            ) <= 1
+
+        # Solve the problem
+        prob.solve()
+
+        # Extract the results
+        result = []
+        for i in range(n):
+            for j in range(len(bulls)):
+                if vars[i, j].value() == 1:
+                    result.append({
+                        "cow": _epds_with_target['cow'][i], 
+                        "bull": bulls[j]
+                    })
+
+        if not result:
+            return None
+            
+        result__df = pl.DataFrame(result)
+        
+        # Count bulls
+        bull_counts = result__df.group_by("bull").agg(
+            pl.len().alias("count")
+        ).sort("count", descending=True)
+        
+        return {
+            "pairings": result__df,
+            "bull_counts": bull_counts
+        }
+    except Exception as e:
+        st.error(f"Optimization error: {e}")
+        return None
+
+
+#Option 3
+
+@st.cache_data
+def run_optimization(_epds_with_target):
+    try:
+        # Get unique cows and bulls
+        cows = _epds_with_target['cow'].unique().to_list()
+        bulls = _epds_with_target['bull'].unique().to_list()
+        
+        # Calculate the bull limit (1/5 of the unique cows)
+        bull_limit = len(cows) // 5
+        
+        # Calculate means for relevant metrics
+        mean_values = {
+            'HB': _epds_with_target.select(pl.mean('HB')).item(),
+            'GM': _epds_with_target.select(pl.mean('GM')).item(),
+            'target': _epds_with_target.select(pl.mean('target')).item(),
+            'ME': _epds_with_target.select(pl.mean('ME')).item(),
+            'CED': _epds_with_target.select(pl.mean('CED')).item(),
+            'Milk': _epds_with_target.select(pl.mean('Milk')).item(),
+            'CEM': _epds_with_target.select(pl.mean('CEM')).item(),
+            'Marb': _epds_with_target.select(pl.mean('Marb')).item(),
+            'STAY': _epds_with_target.select(pl.mean('STAY')).item()
+        }
+        
+        # Initialize the optimization problem
+        prob = LpProblem("Breeding_Optimization", LpMaximize)
+        
+        # Create decision variables
+        n = len(_epds_with_target)
+        vars = {
+            i: LpVariable(f"x_{i}", cat=LpBinary)
+            for i in range(n)
+        }
+        
+        # Calculate a score for each pairing that combines:
+        # 1. Number of metrics above mean
+        # 2. The maximum of HB or GM (whichever is higher)
+        pairing_scores = []
+        for i in range(n):
+            row = _epds_with_target.row(i)
+            
+            # Count metrics where this pairing exceeds the mean
+            above_mean_count = 0
+            metrics = ['HB', 'GM', 'target', 'CED', 'Milk', 'CEM', 'Marb', 'STAY']
+            for metric in metrics:
+                metric_idx = _epds_with_target.columns.index(metric)
+                metric_value = row[metric_idx]
+                
+                # For ME, lower is better so we check if it's below mean
+                if metric == 'ME':
+                    if row[_epds_with_target.columns.index('ME')] < mean_values['ME']:
+                        above_mean_count += 1
+                # For others, higher is better
+                elif metric_value > mean_values[metric]:
+                    above_mean_count += 1
+            
+            # Get HB and GM values
+            hb_value = row[_epds_with_target.columns.index('HB')]
+            gm_value = row[_epds_with_target.columns.index('GM')]
+            
+            # Calculate a combined score that prioritizes:
+            # 1. Number of metrics above mean (weighted more heavily)
+            # 2. The maximum of HB or GM
+            max_hb_gm = max(hb_value, gm_value)
+            
+            # Store cow, bull, and score information
+            pairing_scores.append({
+                'index': i,
+                'cow': row[_epds_with_target.columns.index('cow')],
+                'bull': row[_epds_with_target.columns.index('bull')],
+                'above_mean_count': above_mean_count,
+                'max_hb_gm': max_hb_gm,
+                'hb': hb_value,
+                'gm': gm_value
+            })
+        
+        # Objective function: Maximize a weighted combination of:
+        # 1. The number of metrics above mean (weighted more heavily)
+        # 2. The maximum of HB or GM for each selected pairing
+        prob += lpSum(
+            vars[i] * (5 * pairing_scores[i]['above_mean_count'] + pairing_scores[i]['max_hb_gm'])
+            for i in range(n)
+        )
+        
+        # Constraint: Each cow breeds only once
+        for cow in cows:
+            prob += lpSum(
+                vars[i]
+                for i in range(n)
+                if pairing_scores[i]['cow'] == cow
+            ) <= 1
+        
+        # Constraint: Each bull can breed with at most bull_limit cows
+        for bull in bulls:
+            prob += lpSum(
+                vars[i]
+                for i in range(n)
+                if pairing_scores[i]['bull'] == bull
+            ) <= bull_limit
+        
+        # Solve the problem
+        prob.solve()
+        
+        # Extract the results
+        result = []
+        for i in range(n):
+            if vars[i].value() == 1:  # If this pairing is selected
+                result.append({
+                    "cow": pairing_scores[i]['cow'],
+                    "bull": pairing_scores[i]['bull'],
+                    "above_mean_metrics": pairing_scores[i]['above_mean_count'],
+                    "max_hb_gm": pairing_scores[i]['max_hb_gm'],
+                    "hb": pairing_scores[i]['hb'],
+                    "gm": pairing_scores[i]['gm']
+                })
+        
+        if not result:
+            return None
+            
+        result_df = pl.DataFrame(result)
+        
+        # Count bulls
+        bull_counts = result_df.group_by("bull").agg(
+            pl.len().alias("count")
+        ).sort("count", descending=True)
+        
+        return {
+            "pairings": result_df,
+            "bull_counts": bull_counts
+        }
+    except Exception as e:
+        st.error(f"Optimization error: {e}")
+        return None
+
+
+#Option 4
+@st.cache_data
+def run_optimization(_epds_with_target):
+    try:
+        # Get unique cows and bulls
+        cows = _epds_with_target['cow'].unique().to_list()
+        bulls = _epds_with_target['bull'].unique().to_list()
+        
+        # Calculate the bull limit (1/5 of the unique cows)
+        bull_limit = len(cows) // 5
+        
+        # Calculate means for relevant metrics
+        mean_values = {
+            'HB': _epds_with_target.select(pl.mean('HB')).item(),
+            'GM': _epds_with_target.select(pl.mean('GM')).item(),
+            'target': _epds_with_target.select(pl.mean('target')).item(),
+            'ME': _epds_with_target.select(pl.mean('ME')).item(),
+            'CED': _epds_with_target.select(pl.mean('CED')).item(),
+            'Milk': _epds_with_target.select(pl.mean('Milk')).item(),
+            'CEM': _epds_with_target.select(pl.mean('CEM')).item(),
+            'Marb': _epds_with_target.select(pl.mean('Marb')).item(),
+            'STAY': _epds_with_target.select(pl.mean('STAY')).item()
+        }
+        
+        # Calculate standard deviations for normalization
+        std_values = {
+            'HB': max(_epds_with_target.select(pl.std('HB')).item(), 0.0001),  # Avoid division by zero
+            'GM': max(_epds_with_target.select(pl.std('GM')).item(), 0.0001),
+            'ME': max(_epds_with_target.select(pl.std('ME')).item(), 0.0001),
+            'CED': max(_epds_with_target.select(pl.std('CED')).item(), 0.0001),
+            'Milk': max(_epds_with_target.select(pl.std('Milk')).item(), 0.0001),
+            'CEM': max(_epds_with_target.select(pl.std('CEM')).item(), 0.0001),
+            'Marb': max(_epds_with_target.select(pl.std('Marb')).item(), 0.0001),
+            'STAY': max(_epds_with_target.select(pl.std('STAY')).item(), 0.0001),
+        }
+        
+        # Initialize the optimization problem
+        prob = LpProblem("Breeding_Optimization", LpMaximize)
+        
+        # Create decision variables
+        n = len(_epds_with_target)
+        vars = {
+            i: LpVariable(f"x_{i}", cat=LpBinary)
+            for i in range(n)
+        }
+        
+        # Calculate a score for each pairing based on standardized distances from the mean
+        pairing_scores = []
+        metrics = ['HB', 'GM', 'CED', 'Milk', 'CEM', 'Marb', 'STAY', 'ME']
+        
+        for i in range(n):
+            row = _epds_with_target.row(i)
+            cow = row[_epds_with_target.columns.index('cow')]
+            bull = row[_epds_with_target.columns.index('bull')]
+            
+            # Calculate standardized distance from mean for each metric
+            metric_scores = {}
+            total_distance = 0
+            above_mean_count = 0
+            
+            for metric in metrics:
+                metric_idx = _epds_with_target.columns.index(metric)
+                metric_value = row[metric_idx]
+                
+                # For ME, lower is better
+                if metric == 'ME':
+                    # Negative z-score since lower is better
+                    z_score = (mean_values[metric] - metric_value) / std_values[metric]
+                    is_better = metric_value < mean_values[metric]
+                else:
+                    # Positive z-score since higher is better
+                    z_score = (metric_value - mean_values[metric]) / std_values[metric]
+                    is_better = metric_value > mean_values[metric]
+                
+                # Only count positive contributions (better than mean)
+                if is_better:
+                    above_mean_count += 1
+                    total_distance += max(0, z_score)  # Only use positive distance
+                
+                metric_scores[metric] = {
+                    'value': metric_value,
+                    'z_score': z_score,
+                    'is_better': is_better
+                }
+            
+            # Store all the information for this pairing
+            pairing_scores.append({
+                'index': i,
+                'cow': cow,
+                'bull': bull,
+                'above_mean_count': above_mean_count,
+                'total_distance': total_distance,
+                'metrics': metric_scores,
+                'hb': row[_epds_with_target.columns.index('HB')],
+                'gm': row[_epds_with_target.columns.index('GM')]
+            })
+        
+        # Objective function: Maximize the combined score of:
+        # 1. Number of metrics above mean
+        # 2. Total standardized distance above the mean across all metrics
+        prob += lpSum(
+            vars[i] * (3 * pairing_scores[i]['above_mean_count'] + pairing_scores[i]['total_distance'])
+            for i in range(n)
+        )
+        
+        # Constraint: Each cow breeds only once
+        for cow in cows:
+            prob += lpSum(
+                vars[i]
+                for i in range(n)
+                if pairing_scores[i]['cow'] == cow
+            ) <= 1
+        
+        # Constraint: Each bull can breed with at most bull_limit cows
+        for bull in bulls:
+            prob += lpSum(
+                vars[i]
+                for i in range(n)
+                if pairing_scores[i]['bull'] == bull
+            ) <= bull_limit
+        
+        # Solve the problem
+        prob.solve()
+        
+        # Extract the results
+        result = []
+        for i in range(n):
+            if vars[i].value() == 1:  # If this pairing is selected
+                result.append({
+                    "cow": pairing_scores[i]['cow'],
+                    "bull": pairing_scores[i]['bull'],
+                    "above_mean_count": pairing_scores[i]['above_mean_count'],
+                    "total_distance": round(pairing_scores[i]['total_distance'], 2),
+                    "hb": pairing_scores[i]['hb'],
+                    "gm": pairing_scores[i]['gm']
+                })
+        
+        if not result:
+            return None
+            
+        result_df = pl.DataFrame(result)
+        
+        # Count bulls
+        bull_counts = result_df.group_by("bull").agg(
+            pl.len().alias("count")
+        ).sort("count", descending=True)
+        
+        return {
+            "pairings": result_df,
+            "bull_counts": bull_counts
+        }
+    except Exception as e:
+        st.error(f"Optimization error: {e}")
+        return None
+
+```

@@ -10,6 +10,8 @@ from sklearn.metrics import classification_report, accuracy_score
 import plotly.express as px
 import plotly.graph_objects as go
 from pulp import LpProblem, LpVariable, LpMaximize, lpSum, LpBinary
+import random
+
 
 # Set page config
 st.set_page_config(
@@ -59,14 +61,10 @@ page = st.sidebar.radio("Select a page:", [
 
 # Function to load data
 @st.cache_data
-def load_data(uploaded_file=None):
+def load_data():
     try:
-        # If a file was uploaded, use that data directly
-        if uploaded_file is not None:
-            epds = pl.read_csv(uploaded_file, ignore_errors=True).with_row_index().drop(['Sex', 'DOB', 'BrdCds'], errors="ignore")
-        else:
-            # Try to load data from file
-            epds = pl.read_csv('2025planned_mating.csv', ignore_errors=True).with_row_index().drop(['Sex', 'DOB', 'BrdCds'], errors="ignore")
+        # Try to load the data
+        epds = pl.read_csv('2025cow.csv', ignore_errors=True).with_row_index().drop(['Sex', 'DOB', 'BrdCds'])
         
         # Process data similar to the original code
         epds = epds.with_columns(mean=pl.sum_horizontal(['HB', 'GM']) / 2)
@@ -113,7 +111,6 @@ def load_data(uploaded_file=None):
         st.error(f"Error loading data: {e}")
         # Return sample data if actual data can't be loaded
         return generate_sample_data()
-
 
 def generate_sample_data():
     """Generate sample data if the real data file is not available"""
@@ -181,17 +178,14 @@ def generate_sample_data():
 # Allow uploading a file
 uploaded_file = st.sidebar.file_uploader("Upload your bull data (CSV)", type="csv")
 if uploaded_file is not None:
+    # Save the uploaded file
+    with open("2025cow.csv", "wb") as f:
+        f.write(uploaded_file.getbuffer())
     st.sidebar.success("File uploaded successfully!")
-    
-    # Force reload data when a new file is uploaded
-    st.cache_data.clear()
-    
-    # Load data directly from the uploaded file
-    _df = load_data(uploaded_file)
-    st.sidebar.info("Data loaded from uploaded file")
-else:
-    st.sidebar.info("No file uploaded. Using default or sample data.")
-    _df = load_data()
+
+# Load the data
+_df = load_data()
+
 # Define the criteria similar to your original code
 default_criteria = {
     "ME": -1.0,  # Convert to float
@@ -242,80 +236,14 @@ def calculate_stats(_df):
 stats_original = calculate_stats(_df)
 stats_filtered = calculate_stats(_df_filtered)
 
-st.sidebar.markdown("### Trait Prioritization")
-with st.sidebar.expander("Adjust Trait Weights", expanded=False):
-    st.markdown("Set importance weights for each trait (higher values prioritize the trait)")
-    
-    # Create dictionary to store all weights
-    metric_weights = {}
-    
-    # Common metrics that are likely to be in the data
-    if 'HB' in _df.columns:
-        metric_weights['HB'] = st.slider("Herd Builder (HB) Weight", 
-                                        min_value=0.5, max_value=5.0, value=1.0, step=0.1,
-                                        help="Higher values prioritize the Herd Builder index")
-    
-    if 'GM' in _df.columns:
-        metric_weights['GM'] = st.slider("Grid Master (GM) Weight", 
-                                        min_value=0.5, max_value=5.0, value=1.0, step=0.1,
-                                        help="Higher values prioritize the Grid Master index")
-    
-    if 'ME' in _df.columns:
-        metric_weights['ME'] = st.slider("Mature Weight (ME) Weight", 
-                                        min_value=0.5, max_value=5.0, value=1.0, step=0.1,
-                                        help="Higher values prioritize low mature weight (negative EPD)")
-    
-    if 'CED' in _df.columns:
-        metric_weights['CED'] = st.slider("Calving Ease Direct (CED) Weight", 
-                                         min_value=0.5, max_value=5.0, value=1.0, step=0.1,
-                                         help="Higher values prioritize calving ease")
-    
-    if 'Milk' in _df.columns:
-        metric_weights['Milk'] = st.slider("Milk Production Weight", 
-                                          min_value=0.5, max_value=5.0, value=1.0, step=0.1,
-                                          help="Higher values prioritize milk production")
-    
-    if 'CEM' in _df.columns:
-        metric_weights['CEM'] = st.slider("Calving Ease Maternal (CEM) Weight", 
-                                         min_value=0.5, max_value=5.0, value=1.0, step=0.1,
-                                         help="Higher values prioritize maternal calving ease")
-    
-    if 'Marb' in _df.columns:
-        metric_weights['Marb'] = st.slider("Marbling (Marb) Weight", 
-                                          min_value=0.5, max_value=5.0, value=1.0, step=0.1,
-                                          help="Higher values prioritize marbling")
-    
-    if 'STAY' in _df.columns:
-        metric_weights['STAY'] = st.slider("Stayability (STAY) Weight", 
-                                          min_value=0.5, max_value=5.0, value=1.0, step=0.1,
-                                          help="Higher values prioritize stayability")
-    
-    if 'REA' in _df.columns:
-        metric_weights['REA'] = st.slider("Ribeye Area (REA) Weight", 
-                                         min_value=0.5, max_value=5.0, value=1.0, step=0.1,
-                                         help="Higher values prioritize ribeye area")
-    
-    if 'CW' in _df.columns:
-        metric_weights['CW'] = st.slider("Carcass Weight (CW) Weight", 
-                                        min_value=0.5, max_value=5.0, value=1.0, step=0.1,
-                                        help="Higher values prioritize carcass weight")
-    
-    if 'YG' in _df.columns:
-        metric_weights['YG'] = st.slider("Yield Grade (YG) Weight", 
-                                        min_value=0.5, max_value=5.0, value=1.0, step=0.1,
-                                        help="Higher values prioritize yield grade (lower is better)")
-
-
-# Run the optimization
 @st.cache_data
-def run_optimization(_epds_with_target, target_values=None, metric_weights=None):
+def run_optimization(_epds_with_target, target_values=None):
     """
     Optimize breeding pairs based on target values for various traits.
     
     Parameters:
     _epds_with_target - DataFrame with cow/bull pairs and their traits
     target_values - Dictionary with target values for each trait
-    metric_weights - Dictionary with weight multipliers for each metric
     """
     try:
         # Default target values if not provided
@@ -349,10 +277,6 @@ def run_optimization(_epds_with_target, target_values=None, metric_weights=None)
         for metric in available_metrics:
             std_values[metric] = max(_epds_with_target.select(pl.std(metric)).item(), 0.0001)
         
-        # Use provided metric weights or default to 1.0 for all metrics
-        if metric_weights is None:
-            metric_weights = {metric: 1.0 for metric in available_metrics}
-        
         # Calculate a score for each pairing based on closeness to target values
         pairing_scores = []
         
@@ -371,7 +295,6 @@ def run_optimization(_epds_with_target, target_values=None, metric_weights=None)
                     metric_idx = _epds_with_target.columns.index(metric)
                     metric_value = row[metric_idx]
                     target = target_values.get(metric, 0)
-                    weight = metric_weights.get(metric, 1.0)
                     
                     # Calculate z-score differently based on whether lower or higher is better
                     if metric in lower_is_better:
@@ -383,22 +306,16 @@ def run_optimization(_epds_with_target, target_values=None, metric_weights=None)
                         z_score = (metric_value - target) / std_values[metric]
                         is_better = metric_value >= target
                     
-                    # Apply the metric weight to the score
-                    weighted_z_score = z_score * weight
-                    
                     # Only count positive contributions (better than target)
                     if is_better:
                         better_than_target_count += 1
-                        # Use the weighted score for metrics that are better than target
-                        total_score += max(0, weighted_z_score)
+                        total_score += max(0, z_score)  # Only use positive score
                     
                     metric_scores[metric] = {
                         'value': metric_value,
                         'target': target,
                         'z_score': z_score,
-                        'weighted_z_score': weighted_z_score,
-                        'is_better': is_better,
-                        'weight': weight
+                        'is_better': is_better
                     }
             
             # Store all the information for this pairing
@@ -425,38 +342,12 @@ def run_optimization(_epds_with_target, target_values=None, metric_weights=None)
                 for i in range(n)
             }
             
-            # Prepare weighted bonus terms for each metric
-            metric_bonuses = 0
-            for metric in available_metrics:
-                if metric in _epds_with_target.columns:
-                    metric_idx = _epds_with_target.columns.index(metric)
-                    target = target_values.get(metric, 0)
-                    weight = metric_weights.get(metric, 1.0)
-                    
-                    # Skip if weight is near default (1.0)
-                    if abs(weight - 1.0) < 0.1:
-                        continue
-                        
-                    # For metrics where higher is better (not in lower_is_better)
-                    if metric not in lower_is_better:
-                        metric_bonuses += lpSum(
-                            vars[i] * max(0, (row[metric_idx] - target) / std_values[metric]) * (weight - 1.0)
-                            for i, row in enumerate(_epds_with_target.iter_rows())
-                            if row[metric_idx] >= target
-                        )
-                    # For metrics where lower is better
-                    else:
-                        metric_bonuses += lpSum(
-                            vars[i] * max(0, (target - row[metric_idx]) / std_values[metric]) * (weight - 1.0)
-                            for i, row in enumerate(_epds_with_target.iter_rows())
-                            if row[metric_idx] <= target
-                        )
-            
-            # Objective function: Maximize the combined score plus metric bonuses
+            # Objective function: Maximize the combined score
+            # Weight both the count of metrics better than target and the total score
             prob += lpSum(
                 vars[i] * (3 * pairing_scores[i]['better_than_target_count'] + pairing_scores[i]['total_score'])
                 for i in range(n)
-            ) + metric_bonuses
+            )
             
             # Constraint: Each cow breeds only once
             for cow in cows:
@@ -513,15 +404,12 @@ def run_optimization(_epds_with_target, target_values=None, metric_weights=None)
         secondary_solution, secondary_indices = solve_with_exclusions(primary_indices)
         
         # Convert solutions to DataFrames
-        primary_pairings = pl.DataFrame(primary_solution) if primary_solution else None
+        primary_pairings = pl.DataFrame(primary_solution)
         
         # Count bulls in primary solution
-        if primary_pairings is not None:
-            primary_bull_counts = primary_pairings.group_by("bull").agg(
-                pl.count().alias("count")
-            ).sort("count", descending=True)
-        else:
-            primary_bull_counts = None
+        primary_bull_counts = primary_pairings.group_by("bull").agg(
+            pl.count().alias("count")
+        ).sort("count", descending=True)
         
         # Do the same for secondary solution
         if secondary_solution:
@@ -542,7 +430,6 @@ def run_optimization(_epds_with_target, target_values=None, metric_weights=None)
             "pairing_scores": pairing_scores,
             "available_metrics": available_metrics,
             "target_values": target_values,
-            "metric_weights": metric_weights,
             "total_cows": len(cows),
             "total_bulls": len(bulls),
             "bull_limit": bull_limit
