@@ -1,0 +1,2481 @@
+```{python}
+import pandas as pd
+import numpy as np
+from ortools.sat.python import cp_model
+import matplotlib.pyplot as plt
+import sys
+
+# Constants for the optimization
+MINIMIZE_TRAITS = ['ME', 'BW', 'YG', 'DMI', 'FAT']
+DESCRIPTIVE_COLS = ["AnimalID", "RAAA#", "Sex", "Name", "DOB", "BrdCds"]
+NUM_PAIRS_FIRST_ROUND = 50
+MAX_BULL_USES = 23  # Hard maximum for bull usage
+
+# Target values for second round
+TARGET_VALUES = {
+    'CED': 14, 'BW': -3, 'WW': 65, 'YW': 100, 'ADG': 0.28,
+    'DMI': 0.6, 'Milk': 29, 'ME': -2, 'HPG': 12, 'CEM': 8,
+    'STAY': 18, 'Marb': 0.5, 'YG': 0.03, 'CW': 29, 'REA': 0.17,
+    'FAT': 0, 'HB': 70, 'GM': 46
+}
+
+# Weight factors for traits
+WEIGHT_FACTORS = {
+    'ME': 1.5,  # Higher weight for ME
+    'BW': 1.0,
+    'YG': 1.0,
+    'DMI': 1.0,
+    'FAT': 1.0
+}
+
+def extract_ids(animal_id):
+    """Extract cow ID and bull ID from the AnimalID column"""
+    if pd.isna(animal_id):
+        return None, None
+    
+    # Split on hyphen to extract cow and bull IDs from format like "C17 - 9191G"
+    parts = str(animal_id).split('-')
+    if len(parts) == 2:
+        cow_id = parts[0].strip()
+        bull_id = parts[1].strip()
+        return cow_id, bull_id
+    else:
+        return str(animal_id).strip(), None
+
+def load_data(file_path):
+    """Load the cattle pairing data from CSV or Excel"""
+    try:
+        if file_path.endswith('.csv'):
+            return pd.read_csv(file_path)
+        elif file_path.endswith(('.xlsx', '.xls')):
+            return pd.read_excel(file_path)
+        else:
+            raise ValueError("Unsupported file format. Please provide CSV or Excel file.")
+    except Exception as e:
+        print(f"Error loading data: {e}")
+        return None
+
+def optimize_breeding_first_round(data, num_pairs=NUM_PAIRS_FIRST_ROUND):
+    """
+    Optimize breeding pairs to minimize certain traits and maximize others.
+    With extra emphasis on minimizing ME.
+    
+    Args:
+        data: DataFrame with pre-calculated EPDs for potential breeding pairs
+        num_pairs: Number of pairs to select
+        
+    Returns:
+        Selected pairs DataFrame and remaining pairs DataFrame
+    """
+    # Add extracted cow and bull ID columns
+    cow_bull_ids = data['AnimalID'].apply(extract_ids)
+    data['CowID'] = [x[0] for x in cow_bull_ids]
+    data['BullID'] = [x[1] for x in cow_bull_ids]
+    
+    # Use the hard maximum for bull uses
+    print(f"Total unique cows: {len(data['CowID'].unique())}")
+    print(f"Max uses per bull: {MAX_BULL_USES}")
+    
+    # Identify maximize traits (all numeric traits except those to minimize and descriptive columns)
+    numeric_cols = data.select_dtypes(include=[np.number]).columns.tolist()
+    maximize_traits = [col for col in numeric_cols if col not in MINIMIZE_TRAITS and col not in DESCRIPTIVE_COLS]
+    
+    print(f"Minimizing traits: {MINIMIZE_TRAITS}")
+    print(f"Maximizing traits: {maximize_traits}")
+    print(f"Special emphasis on minimizing ME (weight factor: {WEIGHT_FACTORS['ME']})")
+    
+    # Create CP-SAT model
+    model = cp_model.CpModel()
+    
+    # Create decision variables: 1 if pair i is selected, 0 otherwise
+    pair_vars = {}
+    for i in range(len(data)):
+        pair_vars[i] = model.NewBoolVar(f'pair_{i}')
+    
+    # Constraint: Select exactly num_pairs pairs (or fewer if not enough unique cows)
+    total_cows = len(data['CowID'].unique())
+    num_pairs_to_select = min(num_pairs, total_cows)
+    model.Add(sum(pair_vars.values()) == num_pairs_to_select)
+    
+    # Constraint: Each cow can only be used once
+    cow_indices = {}
+    for i, row in data.iterrows():
+        cow_id = row['CowID']
+        if cow_id not in cow_indices:
+            cow_indices[cow_id] = []
+        cow_indices[cow_id].append(i)
+    
+    for cow_id, indices in cow_indices.items():
+        model.Add(sum(pair_vars[i] for i in indices) <= 1)
+    
+    # Constraint: Each bull can be used at most MAX_BULL_USES times
+    bull_indices = {}
+    for i, row in data.iterrows():
+        bull_id = row['BullID']
+        if pd.notna(bull_id):
+            if bull_id not in bull_indices:
+                bull_indices[bull_id] = []
+            bull_indices[bull_id].append(i)
+    
+    for bull_id, indices in bull_indices.items():
+        model.Add(sum(pair_vars[i] for i in indices) <= MAX_BULL_USES)
+    
+    # Objective: Weighted sum of traits (minimize bad traits, maximize good traits)
+    objective_terms = []
+    
+    # Normalize trait values for better balancing in the objective function
+    normalized_data = data.copy()
+    
+    for trait in MINIMIZE_TRAITS + maximize_traits:
+        if trait in data.columns:
+            # Skip if all values are the same (would cause div by zero)
+            if data[trait].max() == data[trait].min():
+                normalized_data[f'norm_{trait}'] = 0
+                continue
+                
+            # Min-max normalization to [0,1]
+            normalized_data[f'norm_{trait}'] = (data[trait] - data[trait].min()) / (data[trait].max() - data[trait].min())
+    
+    # Create objective terms
+    for i in range(len(data)):
+        # Minimize bad traits with weights
+        for trait in MINIMIZE_TRAITS:
+            norm_trait = f'norm_{trait}'
+            if norm_trait in normalized_data.columns:
+                # Apply weight factor for this trait (default to 1.0 if not specified)
+                weight = WEIGHT_FACTORS.get(trait, 1.0)
+                objective_terms.append(weight * normalized_data.iloc[i][norm_trait] * pair_vars[i])
+        
+        # Maximize good traits (negate for minimization problem)
+        for trait in maximize_traits:
+            norm_trait = f'norm_{trait}'
+            if norm_trait in normalized_data.columns:
+                weight = WEIGHT_FACTORS.get(trait,1.0)
+                objective_terms.append(-weight * normalized_data.iloc[i][norm_trait] * pair_vars[i])
+    
+    # Set objective
+    model.Minimize(sum(objective_terms))
+    
+    # Solve
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = 300  # 5 minute time limit
+    status = solver.Solve(model)
+    
+    # Process results
+    if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
+        print(f"Solution found with status: {solver.StatusName(status)}")
+        
+        # Get selected pairs
+        selected_indices = []
+        for i in range(len(data)):
+            if solver.Value(pair_vars[i]) == 1:
+                selected_indices.append(i)
+        
+        selected_pairs = data.iloc[selected_indices].copy()
+        remaining_pairs = data.drop(selected_indices).copy()
+        
+        print(f"Selected {len(selected_pairs)} pairs in first round")
+        print(f"{len(remaining_pairs)} pairs remaining for second round")
+        
+        # Verify constraints
+        used_cows = selected_pairs['CowID'].tolist()
+        used_bulls = selected_pairs['BullID'].value_counts().to_dict()
+        
+        print(f"Number of unique cows used: {len(set(used_cows))}")
+        print(f"Maximum bull usage: {max(used_bulls.values()) if used_bulls else 0}")
+        
+        return selected_pairs, remaining_pairs
+    else:
+        print(f"No solution found. Status: {solver.StatusName(status)}")
+        return None, data
+
+def optimize_breeding_second_round(remaining_data, first_round_selections):
+    """
+    Second round optimization to hit target values.
+    Prioritizes getting traits in the right direction (above/below target)
+    rather than just minimizing distance.
+    
+    Args:
+        remaining_data: DataFrame with remaining pairs after first round
+        first_round_selections: DataFrame with pairs selected in first round
+        
+    Returns:
+        Selected pairs DataFrame for second round
+    """
+    if len(remaining_data) == 0:
+        print("No remaining pairs for second round")
+        return None
+    
+    # Reset index of remaining_data to ensure we don't have any index gaps
+    remaining_data = remaining_data.reset_index(drop=True)
+    
+    # Extract cow and bull IDs if not already available
+    if 'CowID' not in remaining_data.columns or 'BullID' not in remaining_data.columns:
+        cow_bull_ids = remaining_data['AnimalID'].apply(extract_ids)
+        remaining_data['CowID'] = [x[0] for x in cow_bull_ids]
+        remaining_data['BullID'] = [x[1] for x in cow_bull_ids]
+    
+    # Get already used cows from first round
+    used_cows = first_round_selections['CowID'].unique().tolist()
+    
+    # Count bull uses from first round
+    bull_usage = first_round_selections['BullID'].value_counts().to_dict()
+    
+    # Use hard maximum for bull uses
+    print(f"Max bull uses in second round: {MAX_BULL_USES}")
+    
+    # Weight factors for second round target traits
+    SECOND_ROUND_WEIGHTS = {
+        'Milk': 2.0,  # Prioritize milk production
+        'CED': 1.5,   # Higher importance for calving ease
+        'BW': 1.5,    # Higher importance for birth weight
+        'ME': 1.8,    # Higher importance for maternal effect
+        # Add other traits as needed
+    }
+    
+    # Create CP-SAT model
+    model = cp_model.CpModel()
+    
+    # Create decision variables: 1 if pair i is selected, 0 otherwise
+    pair_vars = {}
+    for i in range(len(remaining_data)):
+        # Only create variables for pairs with unused cows
+        if remaining_data.iloc[i]['CowID'] not in used_cows:
+            pair_vars[i] = model.NewBoolVar(f'pair_{i}')
+    
+    # If no valid pairs remain, return empty result
+    if not pair_vars:
+        print("No valid pairs remain for second round (all cows used)")
+        return pd.DataFrame()
+    
+    # Constraint: Each cow can only be used once
+    cow_indices = {}
+    for i in pair_vars:
+        cow_id = remaining_data.iloc[i]['CowID']
+        if cow_id not in cow_indices:
+            cow_indices[cow_id] = []
+        cow_indices[cow_id].append(i)
+    
+    for cow_id, indices in cow_indices.items():
+        model.Add(sum(pair_vars[i] for i in indices) <= 1)
+    
+    # Constraint: Each bull can be used at most MAX_BULL_USES times (considering first round usage)
+    bull_indices = {}
+    for i in pair_vars:
+        bull_id = remaining_data.iloc[i]['BullID']
+        if pd.notna(bull_id):
+            if bull_id not in bull_indices:
+                bull_indices[bull_id] = []
+            bull_indices[bull_id].append(i)
+    
+    for bull_id, indices in bull_indices.items():
+        previous_uses = bull_usage.get(bull_id, 0)
+        remaining_uses = MAX_BULL_USES - previous_uses
+        
+        if remaining_uses <= 0:
+            # If bull reached limit, don't use again
+            for i in indices:
+                model.Add(pair_vars[i] == 0)
+        else:
+            # Limit remaining uses
+            model.Add(sum(pair_vars[i] for i in indices) <= remaining_uses)
+    
+    # Objective part 1: Maximize number of valid pairs selected
+    pair_count_expr = sum(pair_vars.values())
+    
+    # Objective part 2: Score traits based on direction from target
+    direction_score_terms = []
+    
+    # Precompute trait directions for all pairs
+    trait_directions = {}
+    
+    for trait, target in TARGET_VALUES.items():
+        if trait in remaining_data.columns:
+            # Determine if higher or lower is better for this trait
+            # We want to get as far above or below target as possible
+            # Higher is better for most traits like CED, WW, YW, etc.
+            higher_is_better = True
+            
+            # List traits where lower is better (you may need to adjust this list)
+            lower_is_better_traits = ['BW', 'ME', 'DMI', 'YG', 'FAT']
+            if trait in lower_is_better_traits:
+                higher_is_better = False
+            
+            # Get trait weight (default to 1.0 if not specified)
+            trait_weight = SECOND_ROUND_WEIGHTS.get(trait, 1.0)
+            
+            # Scale factor to normalize impact of different traits
+            scale_factor = remaining_data[trait].std()
+            if scale_factor == 0:  # Handle case where std dev is 0
+                scale_factor = 1
+            
+            for i in pair_vars:
+                trait_value = remaining_data.iloc[i][trait]
+                
+                # Calculate normalized distance from target (positive means above target)
+                normalized_distance = (trait_value - target) / scale_factor
+                
+                if higher_is_better:
+                    # For traits where higher is better:
+                    # - If already above target, reward for being even higher
+                    # - If below target, penalize but less severely
+                    if normalized_distance >= 0:
+                        # Above target - good! Reward with negative term (we're minimizing)
+                        direction_score_terms.append(-trait_weight * normalized_distance * pair_vars[i])
+                    else:
+                        # Below target - penalize but less severely
+                        direction_score_terms.append(0.5 * trait_weight * abs(normalized_distance) * pair_vars[i])
+                else:
+                    # For traits where lower is better:
+                    # - If already below target, reward for being even lower
+                    # - If above target, penalize but less severely
+                    if normalized_distance <= 0:
+                        # Below target - good! Reward with negative term (we're minimizing)
+                        direction_score_terms.append(-trait_weight * abs(normalized_distance) * pair_vars[i])
+                    else:
+                        # Above target - penalize but less severely
+                        direction_score_terms.append(0.5 * trait_weight * normalized_distance * pair_vars[i])
+    
+    # Multi-objective: First maximize number of pairs, then optimize trait directions
+    # We scale the objectives to ensure pair count is prioritized
+    scaling_factor = 1000  # Large enough to ensure pair count takes priority
+    
+    # Set objective
+    model.Minimize(-scaling_factor * pair_count_expr + sum(direction_score_terms))
+    
+    # Solve
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = 300  # 5 minute time limit
+    status = solver.Solve(model)
+    
+    # Process results
+    if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
+        print(f"Solution found with status: {solver.StatusName(status)}")
+        
+        # Get selected pairs
+        selected_indices = []
+        for i in pair_vars:
+            if solver.Value(pair_vars[i]) == 1:
+                selected_indices.append(i)
+        
+        second_round_selections = remaining_data.iloc[selected_indices].copy()
+        
+        print(f"Selected {len(second_round_selections)} pairs in second round")
+        
+        # Verify constraints
+        round2_used_cows = second_round_selections['CowID'].tolist()
+        round2_used_bulls = second_round_selections['BullID'].value_counts().to_dict()
+        
+        # Check for cow overlap between rounds
+        common_cows = set(used_cows).intersection(set(round2_used_cows))
+        if common_cows:
+            print(f"WARNING: Found {len(common_cows)} cows used in both rounds!")
+        
+        print(f"Number of unique cows used in round 2: {len(set(round2_used_cows))}")
+        print(f"Maximum bull usage in round 2: {max(round2_used_bulls.values()) if round2_used_bulls else 0}")
+        
+        # Calculate and display how many traits are in the right direction
+        right_direction_count = 0
+        total_traits = 0
+        
+        for trait, target in TARGET_VALUES.items():
+            if trait in second_round_selections.columns:
+                total_traits += 1
+                trait_avg = second_round_selections[trait].mean()
+                
+                # Determine if higher or lower is better
+                lower_is_better_traits = ['BW', 'ME', 'DMI', 'YG', 'FAT']
+                wants_lower = trait in lower_is_better_traits
+                
+                # Check if we're in the right direction
+                if (wants_lower and trait_avg <= target) or (not wants_lower and trait_avg >= target):
+                    right_direction_count += 1
+                    print(f"{trait}: CORRECT DIRECTION - Target: {target}, Achieved: {trait_avg:.2f}")
+                else:
+                    print(f"{trait}: WRONG DIRECTION - Target: {target}, Achieved: {trait_avg:.2f}")
+        
+        print(f"Traits in correct direction: {right_direction_count}/{total_traits} ({right_direction_count/total_traits*100:.1f}%)")
+        
+        return second_round_selections
+    else:
+        print(f"No solution found for second round. Status: {solver.StatusName(status)}")
+        return None
+
+def analyze_results(first_round, second_round=None):
+    """Analyze and visualize optimization results"""
+    # Combine results if we have both rounds
+    if second_round is not None and len(second_round) > 0:
+        all_results = pd.concat([first_round, second_round], ignore_index=True)
+        all_results['Round'] = [1] * len(first_round) + [2] * len(second_round)
+    else:
+        all_results = first_round.copy()
+        all_results['Round'] = 1
+    
+    # Save full results
+    all_results.to_csv('breeding_optimization_results.csv', index=False)
+    print("Full results saved to 'breeding_optimization_results.csv'")
+    
+    # Verify each cow is used only once
+    cow_counts = all_results['CowID'].value_counts()
+    if (cow_counts > 1).any():
+        print("WARNING: Some cows were used more than once!")
+        print(cow_counts[cow_counts > 1])
+    else:
+        print("VERIFIED: Each cow is used exactly once.")
+    
+    # Verify bull usage constraint
+    bull_counts = all_results['BullID'].value_counts()
+    
+    if (bull_counts > MAX_BULL_USES).any():
+        print(f"WARNING: Some bulls were used more than the maximum allowed ({MAX_BULL_USES})!")
+        print(bull_counts[bull_counts > MAX_BULL_USES])
+    else:
+        print(f"VERIFIED: No bull is used more than {MAX_BULL_USES} times.")
+    
+    # Summarize bull usage
+    bull_usage = all_results['BullID'].value_counts().reset_index()
+    bull_usage.columns = ['Bull_ID', 'Usage_Count']
+    bull_usage = bull_usage.sort_values('Usage_Count', ascending=False)
+    bull_usage.to_csv('bull_usage_summary.csv', index=False)
+    print("Bull usage summary saved to 'bull_usage_summary.csv'")
+    
+    # Calculate trait averages for each round
+    trait_cols = [col for col in all_results.columns 
+                 if col not in DESCRIPTIVE_COLS + ['Round', 'CowID', 'BullID']]
+    
+    print("\nTrait averages by round:")
+    round_averages = all_results.groupby('Round')[trait_cols].mean()
+    print(round_averages)
+    
+    # Save round averages
+    round_averages.to_csv('trait_averages_by_round.csv')
+    
+    # Create visualizations
+    create_visualizations(all_results, trait_cols)
+    
+    return all_results
+
+def create_visualizations(results, trait_cols):
+    """Create various visualizations of the results"""
+    # 1. Bull usage chart
+    bull_usage = results['BullID'].value_counts()
+    plt.figure(figsize=(12, 6))
+    bull_usage.plot(kind='bar')
+    plt.title('Number of Times Each Bull is Used')
+    plt.xlabel('Bull ID')
+    plt.ylabel('Count')
+    plt.tight_layout()
+    plt.savefig('bull_usage.png')
+    plt.close()
+    
+    # 2. Trait distributions by round
+    # Select important traits to visualize (minimize and some key maximize traits)
+    key_traits = MINIMIZE_TRAITS + ['CED', 'WW', 'YW', 'Marb', 'REA']
+    key_traits = [t for t in key_traits if t in trait_cols]
+    
+    # Create subplots for each trait
+    fig, axes = plt.subplots(nrows=len(key_traits), ncols=1, figsize=(10, 3*len(key_traits)))
+    
+    if len(key_traits) == 1:
+        axes = [axes]  # Make iterable if only one subplot
+        
+    for i, trait in enumerate(key_traits):
+        if 'Round' in results.columns and len(results['Round'].unique()) > 1:
+            # If we have multiple rounds, show histograms by round
+            for round_num in sorted(results['Round'].unique()):
+                round_data = results[results['Round'] == round_num]
+                axes[i].hist(round_data[trait], alpha=0.5, label=f'Round {round_num}')
+            axes[i].legend()
+        else:
+            axes[i].hist(results[trait])
+            
+        axes[i].set_title(f'Distribution of {trait}')
+        axes[i].set_xlabel(trait)
+        axes[i].set_ylabel('Count')
+    
+    plt.tight_layout()
+    plt.savefig('trait_distributions.png')
+    plt.close()
+    
+    # 3. Comparison between rounds
+    if 'Round' in results.columns and len(results['Round'].unique()) > 1:
+        round_means = results.groupby('Round')[key_traits].mean()
+        
+        fig, ax = plt.subplots(figsize=(12, 8))
+        round_means.plot(kind='bar', ax=ax)
+        plt.title('Average Trait Values by Round')
+        plt.ylabel('Value')
+        plt.legend(title='Trait')
+        plt.tight_layout()
+        plt.savefig('round_comparison.png')
+        plt.close()
+    
+    # 4. Comparison to target values (second round)
+    if 'Round' in results.columns and 2 in results['Round'].values:
+        second_round_data = results[results['Round'] == 2]
+        
+        # Calculate distances to targets
+        target_comparisons = []
+        
+        for trait, target in TARGET_VALUES.items():
+            if trait in second_round_data.columns:
+                avg_value = second_round_data[trait].mean()
+                target_comparisons.append({
+                    'Trait': trait,
+                    'Target': target,
+                    'Achieved': avg_value,
+                    'Difference': avg_value - target
+                })
+        
+        target_df = pd.DataFrame(target_comparisons)
+        target_df.to_csv('target_comparison.csv', index=False)
+        
+        # Create bar chart showing achievement vs targets
+        plt.figure(figsize=(12, 8))
+        traits = target_df['Trait'].tolist()
+        x = np.arange(len(traits))
+        width = 0.35
+        
+        plt.bar(x - width/2, target_df['Target'], width, label='Target')
+        plt.bar(x + width/2, target_df['Achieved'], width, label='Achieved')
+        
+        plt.title('Target vs Achieved Values (Second Round)')
+        plt.xticks(x, traits, rotation=45, ha='right')
+        plt.ylabel('Value')
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig('target_comparison.png')
+        plt.close()
+        
+        # 5. Create a heat map of trait differences from targets
+        absolute_differences = target_df.copy()
+        absolute_differences['AbsDiff'] = abs(absolute_differences['Difference'])
+        absolute_differences = absolute_differences.sort_values('AbsDiff', ascending=False)
+        
+        plt.figure(figsize=(10, 6))
+        plt.bar(absolute_differences['Trait'], absolute_differences['AbsDiff'])
+        plt.title('Absolute Difference from Target Values (Second Round)')
+        plt.xlabel('Trait')
+        plt.ylabel('Absolute Difference')
+        plt.xticks(rotation=45, ha='right')
+        plt.tight_layout()
+        plt.savefig('target_absolute_differences.png')
+        plt.close()
+
+def main(data_path):
+    # Load data
+    data = load_data(data_path)
+    if data is None:
+        print("Failed to load data. Please check the file path and format.")
+        return
+    
+    print(f"Loaded {len(data)} potential breeding pairs")
+    
+    # Run first round optimization
+    first_round, remaining = optimize_breeding_first_round(data)
+    
+    if first_round is None:
+        print("First round optimization failed. Exiting.")
+        return
+    
+    # Run second round optimization
+    try:
+        second_round = optimize_breeding_second_round(remaining, first_round)
+    except KeyError as e:
+        print(f"KeyError encountered in second round: {e}")
+        print("Proceeding with only first round results")
+        second_round = None
+    except Exception as e:
+        print(f"Error in second round optimization: {e}")
+        print("Proceeding with only first round results")
+        second_round = None
+    
+    # Analyze results
+    analyze_results(first_round, second_round)
+    
+    print("\nOptimization complete!")
+    print(f"Selected {len(first_round)} pairs in first round")
+    if second_round is not None:
+        print(f"Selected {len(second_round)} pairs in second round")
+    print(f"Total pairs selected: {len(first_round) + (len(second_round) if second_round is not None else 0)}")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python cattle_optimization.py <data_file_path>")
+        data_path = '2025cow.csv'  # Default file if not provided
+        print(f"No file specified, using default: {data_path}")
+    else:
+        data_path = sys.argv[1]
+    
+
+```
+
+```{python}
+import pandas as pd
+import numpy as np
+from ortools.sat.python import cp_model
+import matplotlib.pyplot as plt
+import sys
+
+# Constants for the optimization
+MINIMIZE_TRAITS = ['ME', 'BW', 'YG', 'DMI', 'FAT']
+DESCRIPTIVE_COLS = ["AnimalID", "RAAA#", "Sex", "Name", "DOB", "BrdCds"]
+NUM_PAIRS_FIRST_ROUND = 50
+MAX_BULL_USES = 23  # Hard maximum for bull usage
+
+# Target values for second round
+TARGET_VALUES = {
+    'CED': 14, 'BW': -3, 'WW': 65, 'YW': 100, 'ADG': 0.28,
+    'DMI': 0.6, 'Milk': 29, 'ME': -2, 'HPG': 12, 'CEM': 8,
+    'STAY': 18, 'Marb': 0.5, 'YG': 0.03, 'CW': 29, 'REA': 0.17,
+    'FAT': 0, 'HB': 70, 'GM': 46
+}
+
+# Weight factors for traits
+WEIGHT_FACTORS = {
+    'ME': 1.5,  # Higher weight for ME
+    'BW': 1.0,
+    'YG': 1.0,
+    'DMI': 1.0,
+    'FAT': 1.0
+}
+
+def extract_ids(animal_id):
+    """Extract cow ID and bull ID from the AnimalID column"""
+    if pd.isna(animal_id):
+        return None, None
+    
+    # Split on hyphen to extract cow and bull IDs from format like "C17 - 9191G"
+    parts = str(animal_id).split('-')
+    if len(parts) == 2:
+        cow_id = parts[0].strip()
+        bull_id = parts[1].strip()
+        return cow_id, bull_id
+    else:
+        return str(animal_id).strip(), None
+
+def load_data(file_path):
+    """Load the cattle pairing data from CSV or Excel"""
+    try:
+        if file_path.endswith('.csv'):
+            return pd.read_csv(file_path)
+        elif file_path.endswith(('.xlsx', '.xls')):
+            return pd.read_excel(file_path)
+        else:
+            raise ValueError("Unsupported file format. Please provide CSV or Excel file.")
+    except Exception as e:
+        print(f"Error loading data: {e}")
+        return None
+
+def optimize_breeding_first_round(data, num_pairs=NUM_PAIRS_FIRST_ROUND):
+    """
+    Optimize breeding pairs to minimize certain traits and maximize others.
+    With extra emphasis on minimizing ME.
+    
+    Args:
+        data: DataFrame with pre-calculated EPDs for potential breeding pairs
+        num_pairs: Number of pairs to select
+        
+    Returns:
+        Selected pairs DataFrame and remaining pairs DataFrame
+    """
+    # Add extracted cow and bull ID columns
+    cow_bull_ids = data['AnimalID'].apply(extract_ids)
+    data['CowID'] = [x[0] for x in cow_bull_ids]
+    data['BullID'] = [x[1] for x in cow_bull_ids]
+    
+    # Use the hard maximum for bull uses
+    print(f"Total unique cows: {len(data['CowID'].unique())}")
+    print(f"Max uses per bull: {MAX_BULL_USES}")
+    
+    # Identify maximize traits (all numeric traits except those to minimize and descriptive columns)
+    numeric_cols = data.select_dtypes(include=[np.number]).columns.tolist()
+    maximize_traits = [col for col in numeric_cols if col not in MINIMIZE_TRAITS and col not in DESCRIPTIVE_COLS]
+    
+    print(f"Minimizing traits: {MINIMIZE_TRAITS}")
+    print(f"Maximizing traits: {maximize_traits}")
+    print(f"Special emphasis on minimizing ME (weight factor: {WEIGHT_FACTORS['ME']})")
+    
+    # Create CP-SAT model
+    model = cp_model.CpModel()
+    
+    # Create decision variables: 1 if pair i is selected, 0 otherwise
+    pair_vars = {}
+    for i in range(len(data)):
+        pair_vars[i] = model.NewBoolVar(f'pair_{i}')
+    
+    # Constraint: Select exactly num_pairs pairs (or fewer if not enough unique cows)
+    total_cows = len(data['CowID'].unique())
+    num_pairs_to_select = min(num_pairs, total_cows)
+    model.Add(sum(pair_vars.values()) == num_pairs_to_select)
+    
+    # Constraint: Each cow can only be used once
+    cow_indices = {}
+    for i, row in data.iterrows():
+        cow_id = row['CowID']
+        if cow_id not in cow_indices:
+            cow_indices[cow_id] = []
+        cow_indices[cow_id].append(i)
+    
+    for cow_id, indices in cow_indices.items():
+        model.Add(sum(pair_vars[i] for i in indices) <= 1)
+    
+    # Constraint: Each bull can be used at most MAX_BULL_USES times
+    bull_indices = {}
+    for i, row in data.iterrows():
+        bull_id = row['BullID']
+        if pd.notna(bull_id):
+            if bull_id not in bull_indices:
+                bull_indices[bull_id] = []
+            bull_indices[bull_id].append(i)
+    
+    for bull_id, indices in bull_indices.items():
+        model.Add(sum(pair_vars[i] for i in indices) <= MAX_BULL_USES)
+    
+    # Objective: Weighted sum of traits (minimize bad traits, maximize good traits)
+    objective_terms = []
+    
+    # Normalize trait values for better balancing in the objective function
+    normalized_data = data.copy()
+    
+    for trait in MINIMIZE_TRAITS + maximize_traits:
+        if trait in data.columns:
+            # Skip if all values are the same (would cause div by zero)
+            if data[trait].max() == data[trait].min():
+                normalized_data[f'norm_{trait}'] = 0
+                continue
+                
+            # Min-max normalization to [0,1]
+            normalized_data[f'norm_{trait}'] = (data[trait] - data[trait].min()) / (data[trait].max() - data[trait].min())
+    
+    # Create objective terms
+    for i in range(len(data)):
+        # Minimize bad traits with weights
+        for trait in MINIMIZE_TRAITS:
+            norm_trait = f'norm_{trait}'
+            if norm_trait in normalized_data.columns:
+                # Apply weight factor for this trait (default to 1.0 if not specified)
+                weight = WEIGHT_FACTORS.get(trait, 1.0)
+                objective_terms.append(weight * normalized_data.iloc[i][norm_trait] * pair_vars[i])
+        
+        # Maximize good traits (negate for minimization problem)
+        for trait in maximize_traits:
+            norm_trait = f'norm_{trait}'
+            if norm_trait in normalized_data.columns:
+                weight = WEIGHT_FACTORS.get(trait,1.0)
+                objective_terms.append(-weight * normalized_data.iloc[i][norm_trait] * pair_vars[i])
+    
+    # Set objective
+    model.Minimize(sum(objective_terms))
+    
+    # Solve
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = 300  # 5 minute time limit
+    status = solver.Solve(model)
+    
+    # Process results
+    if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
+        print(f"Solution found with status: {solver.StatusName(status)}")
+        
+        # Get selected pairs
+        selected_indices = []
+        for i in range(len(data)):
+            if solver.Value(pair_vars[i]) == 1:
+                selected_indices.append(i)
+        
+        selected_pairs = data.iloc[selected_indices].copy()
+        remaining_pairs = data.drop(selected_indices).copy()
+        
+        print(f"Selected {len(selected_pairs)} pairs in first round")
+        print(f"{len(remaining_pairs)} pairs remaining for second round")
+        
+        # Verify constraints
+        used_cows = selected_pairs['CowID'].tolist()
+        used_bulls = selected_pairs['BullID'].value_counts().to_dict()
+        
+        print(f"Number of unique cows used: {len(set(used_cows))}")
+        print(f"Maximum bull usage: {max(used_bulls.values()) if used_bulls else 0}")
+        
+        return selected_pairs, remaining_pairs
+    else:
+        print(f"No solution found. Status: {solver.StatusName(status)}")
+        return None, data
+
+def optimize_breeding_second_round(remaining_data, first_round_selections):
+    """
+    Second round optimization to maximize total metrics above target values,
+    but only selecting pairs where ME ≤ 0 and CED ≥ 14.
+    """
+    if len(remaining_data) == 0:
+        print("No remaining pairs for second round")
+        return None
+    
+    # Reset index of remaining_data to ensure we don't have any index gaps
+    remaining_data = remaining_data.reset_index(drop=True)
+    
+    # Extract cow and bull IDs if not already available
+    if 'CowID' not in remaining_data.columns or 'BullID' not in remaining_data.columns:
+        cow_bull_ids = remaining_data['AnimalID'].apply(extract_ids)
+        remaining_data['CowID'] = [x[0] for x in cow_bull_ids]
+        remaining_data['BullID'] = [x[1] for x in cow_bull_ids]
+    
+    # Get already used cows from first round
+    used_cows = first_round_selections['CowID'].unique().tolist()
+    
+    # Count bull uses from first round
+    bull_usage = first_round_selections['BullID'].value_counts().to_dict()
+    
+    # Filter remaining data to only include pairs where ME ≤ 0 and CED ≥ 14
+    valid_rows = (remaining_data['ME'] <= 0) & (remaining_data['CED'] >= 14)
+    
+    # Check if we have any valid pairs after filtering
+    if not valid_rows.any():
+        print("No pairs meet the required ME ≤ 0 and CED ≥ 14 criteria")
+        return pd.DataFrame()
+    
+    # Filter the data
+    filtered_data = remaining_data[valid_rows].reset_index(drop=True)
+    print(f"Found {len(filtered_data)} pairs meeting ME ≤ 0 and CED ≥ 14 criteria")
+    
+    # Create CP-SAT model
+    model = cp_model.CpModel()
+    
+    # Create decision variables: 1 if pair i is selected, 0 otherwise
+    pair_vars = {}
+    for i in range(len(filtered_data)):
+        # Only create variables for pairs with unused cows
+        if filtered_data.iloc[i]['CowID'] not in used_cows:
+            pair_vars[i] = model.NewBoolVar(f'pair_{i}')
+    
+    # If no valid pairs remain, return empty result
+    if not pair_vars:
+        print("No valid pairs remain for second round (all cows used or don't meet criteria)")
+        return pd.DataFrame()
+    
+    # Constraint: Each cow can only be used once
+    cow_indices = {}
+    for i in pair_vars:
+        cow_id = filtered_data.iloc[i]['CowID']
+        if cow_id not in cow_indices:
+            cow_indices[cow_id] = []
+        cow_indices[cow_id].append(i)
+    
+    for cow_id, indices in cow_indices.items():
+        model.Add(sum(pair_vars[i] for i in indices) <= 1)
+    
+    # Constraint: Each bull can be used at most MAX_BULL_USES times (considering first round usage)
+    bull_indices = {}
+    for i in pair_vars:
+        bull_id = filtered_data.iloc[i]['BullID']
+        if pd.notna(bull_id):
+            if bull_id not in bull_indices:
+                bull_indices[bull_id] = []
+            bull_indices[bull_id].append(i)
+    
+    for bull_id, indices in bull_indices.items():
+        previous_uses = bull_usage.get(bull_id, 0)
+        remaining_uses = MAX_BULL_USES - previous_uses
+        
+        if remaining_uses <= 0:
+            # If bull reached limit, don't use again
+            for i in indices:
+                model.Add(pair_vars[i] == 0)
+        else:
+            # Limit remaining uses
+            model.Add(sum(pair_vars[i] for i in indices) <= remaining_uses)
+    
+    # Objective: Maximize the total count of metrics above target values
+    # For each pair, we'll count how many traits exceed their target values
+    above_target_terms = []
+    
+    # Determine which traits should be higher or lower than target
+    higher_is_better_traits = [t for t in TARGET_VALUES.keys() if t not in ['BW', 'ME', 'DMI', 'YG', 'FAT']]
+    lower_is_better_traits = ['BW', 'ME', 'DMI', 'YG', 'FAT']
+    
+    # Add objective terms for each valid pair
+    for i in pair_vars:
+        # For each higher-is-better trait, count if it's above target
+        for trait in higher_is_better_traits:
+            if trait in filtered_data.columns:
+                trait_value = filtered_data.iloc[i][trait]
+                target = TARGET_VALUES.get(trait, 0)
+                
+                if trait_value >= target:
+                    # Add 1 to count if above target (negative for minimization problem)
+                    above_target_terms.append(-1 * pair_vars[i])  # Negative because we're minimizing
+        
+        # For each lower-is-better trait, count if it's below target
+        for trait in lower_is_better_traits:
+            if trait in filtered_data.columns:
+                trait_value = filtered_data.iloc[i][trait]
+                target = TARGET_VALUES.get(trait, 0)
+                
+                if trait_value <= target:
+                    # Add 1 to count if below target (negative for minimization problem)
+                    above_target_terms.append(-1 * pair_vars[i])  # Negative because we're minimizing
+    
+    # Objective part 1: Maximize number of valid pairs selected
+    pair_count_expr = sum(pair_vars.values())
+    
+    # Set objective: First maximize number of pairs, then maximize traits meeting targets
+    # We scale the objectives to ensure pair count takes priority
+    scaling_factor = 1000  # Large enough to ensure pair count takes priority
+    
+    # Set objective to minimize negative counts (equivalent to maximizing)
+    model.Minimize(-scaling_factor * pair_count_expr + sum(above_target_terms))
+    
+    # Solve
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = 300  # 5 minute time limit
+    status = solver.Solve(model)
+    
+    # Process results
+    if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
+        print(f"Solution found with status: {solver.StatusName(status)}")
+        
+        # Get selected pairs
+        selected_indices = []
+        for i in pair_vars:
+            if solver.Value(pair_vars[i]) == 1:
+                selected_indices.append(i)
+        
+        second_round_selections = filtered_data.iloc[selected_indices].copy()
+        
+        print(f"Selected {len(second_round_selections)} pairs in second round")
+        
+        # Verify constraints
+        round2_used_cows = second_round_selections['CowID'].tolist()
+        round2_used_bulls = second_round_selections['BullID'].value_counts().to_dict()
+        
+        # Check for cow overlap between rounds
+        common_cows = set(used_cows).intersection(set(round2_used_cows))
+        if common_cows:
+            print(f"WARNING: Found {len(common_cows)} cows used in both rounds!")
+        
+        print(f"Number of unique cows used in round 2: {len(set(round2_used_cows))}")
+        print(f"Maximum bull usage in round 2: {max(round2_used_bulls.values()) if round2_used_bulls else 0}")
+        
+        # Verify all selected pairs meet ME ≤ 0 and CED ≥ 14
+        me_check = (second_round_selections['ME'] <= 0).all()
+        ced_check = (second_round_selections['CED'] >= 14).all()
+        
+        if me_check and ced_check:
+            print("CONFIRMED: All selected pairs meet ME ≤ 0 and CED ≥ 14 criteria")
+        else:
+            print("WARNING: Some selected pairs don't meet the criteria!")
+            print(f"  Pairs with ME > 0: {(second_round_selections['ME'] > 0).sum()}")
+            print(f"  Pairs with CED < 14: {(second_round_selections['CED'] < 14).sum()}")
+        
+        # Calculate and display target achievement stats
+        print("\nTarget achievement summary:")
+        above_target_count = {}
+        
+        for trait, target in TARGET_VALUES.items():
+            if trait in second_round_selections.columns:
+                if trait in higher_is_better_traits:
+                    above_count = (second_round_selections[trait] >= target).sum()
+                    print(f"{trait}: {above_count}/{len(second_round_selections)} pairs above target {target}")
+                    above_target_count[trait] = above_count
+                else:
+                    below_count = (second_round_selections[trait] <= target).sum()
+                    print(f"{trait}: {below_count}/{len(second_round_selections)} pairs below target {target}")
+                    above_target_count[trait] = below_count
+        
+        return second_round_selections
+    else:
+        print(f"No solution found for second round. Status: {solver.StatusName(status)}")
+        return None
+
+def analyze_results(first_round, second_round=None):
+    """Analyze and visualize optimization results"""
+    # Combine results if we have both rounds
+    if second_round is not None and len(second_round) > 0:
+        all_results = pd.concat([first_round, second_round], ignore_index=True)
+        all_results['Round'] = [1] * len(first_round) + [2] * len(second_round)
+    else:
+        all_results = first_round.copy()
+        all_results['Round'] = 1
+    
+    # Save full results
+    all_results.to_csv('breeding_optimization_results.csv', index=False)
+    print("Full results saved to 'breeding_optimization_results.csv'")
+    
+    # Verify each cow is used only once
+    cow_counts = all_results['CowID'].value_counts()
+    if (cow_counts > 1).any():
+        print("WARNING: Some cows were used more than once!")
+        print(cow_counts[cow_counts > 1])
+    else:
+        print("VERIFIED: Each cow is used exactly once.")
+    
+    # Verify bull usage constraint
+    bull_counts = all_results['BullID'].value_counts()
+    
+    if (bull_counts > MAX_BULL_USES).any():
+        print(f"WARNING: Some bulls were used more than the maximum allowed ({MAX_BULL_USES})!")
+        print(bull_counts[bull_counts > MAX_BULL_USES])
+    else:
+        print(f"VERIFIED: No bull is used more than {MAX_BULL_USES} times.")
+    
+    # Summarize bull usage
+    bull_usage = all_results['BullID'].value_counts().reset_index()
+    bull_usage.columns = ['Bull_ID', 'Usage_Count']
+    bull_usage = bull_usage.sort_values('Usage_Count', ascending=False)
+    bull_usage.to_csv('bull_usage_summary.csv', index=False)
+    print("Bull usage summary saved to 'bull_usage_summary.csv'")
+    
+    # Calculate trait averages for each round
+    trait_cols = [col for col in all_results.columns 
+                 if col not in DESCRIPTIVE_COLS + ['Round', 'CowID', 'BullID']]
+    
+    print("\nTrait averages by round:")
+    round_averages = all_results.groupby('Round')[trait_cols].mean()
+    print(round_averages)
+    
+    # Save round averages
+    round_averages.to_csv('trait_averages_by_round.csv')
+    
+    # Create visualizations
+    create_visualizations(all_results, trait_cols)
+    
+    return all_results
+
+def create_visualizations(results, trait_cols):
+    """Create various visualizations of the results"""
+    # 1. Bull usage chart
+    bull_usage = results['BullID'].value_counts()
+    plt.figure(figsize=(12, 6))
+    bull_usage.plot(kind='bar')
+    plt.title('Number of Times Each Bull is Used')
+    plt.xlabel('Bull ID')
+    plt.ylabel('Count')
+    plt.tight_layout()
+    plt.savefig('bull_usage.png')
+    plt.close()
+    
+    # 2. Trait distributions by round
+    # Select important traits to visualize (minimize and some key maximize traits)
+    key_traits = MINIMIZE_TRAITS + ['CED', 'WW', 'YW', 'Marb', 'REA']
+    key_traits = [t for t in key_traits if t in trait_cols]
+    
+    # Create subplots for each trait
+    fig, axes = plt.subplots(nrows=len(key_traits), ncols=1, figsize=(10, 3*len(key_traits)))
+    
+    if len(key_traits) == 1:
+        axes = [axes]  # Make iterable if only one subplot
+        
+    for i, trait in enumerate(key_traits):
+        if 'Round' in results.columns and len(results['Round'].unique()) > 1:
+            # If we have multiple rounds, show histograms by round
+            for round_num in sorted(results['Round'].unique()):
+                round_data = results[results['Round'] == round_num]
+                axes[i].hist(round_data[trait], alpha=0.5, label=f'Round {round_num}')
+            axes[i].legend()
+        else:
+            axes[i].hist(results[trait])
+            
+        axes[i].set_title(f'Distribution of {trait}')
+        axes[i].set_xlabel(trait)
+        axes[i].set_ylabel('Count')
+    
+    plt.tight_layout()
+    plt.savefig('trait_distributions.png')
+    plt.close()
+    
+    # 3. Comparison between rounds
+    if 'Round' in results.columns and len(results['Round'].unique()) > 1:
+        round_means = results.groupby('Round')[key_traits].mean()
+        
+        fig, ax = plt.subplots(figsize=(12, 8))
+        round_means.plot(kind='bar', ax=ax)
+        plt.title('Average Trait Values by Round')
+        plt.ylabel('Value')
+        plt.legend(title='Trait')
+        plt.tight_layout()
+        plt.savefig('round_comparison.png')
+        plt.close()
+    
+    # 4. Comparison to target values (second round)
+    if 'Round' in results.columns and 2 in results['Round'].values:
+        second_round_data = results[results['Round'] == 2]
+        
+        # Calculate distances to targets
+        target_comparisons = []
+        
+        for trait, target in TARGET_VALUES.items():
+            if trait in second_round_data.columns:
+                avg_value = second_round_data[trait].mean()
+                target_comparisons.append({
+                    'Trait': trait,
+                    'Target': target,
+                    'Achieved': avg_value,
+                    'Difference': avg_value - target
+                })
+        
+        target_df = pd.DataFrame(target_comparisons)
+        target_df.to_csv('target_comparison.csv', index=False)
+        
+        # Create bar chart showing achievement vs targets
+        plt.figure(figsize=(12, 8))
+        traits = target_df['Trait'].tolist()
+        x = np.arange(len(traits))
+        width = 0.35
+        
+        plt.bar(x - width/2, target_df['Target'], width, label='Target')
+        plt.bar(x + width/2, target_df['Achieved'], width, label='Achieved')
+        
+        plt.title('Target vs Achieved Values (Second Round)')
+        plt.xticks(x, traits, rotation=45, ha='right')
+        plt.ylabel('Value')
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig('target_comparison.png')
+        plt.close()
+        
+        # 5. Create a heat map of trait differences from targets
+        absolute_differences = target_df.copy()
+        absolute_differences['AbsDiff'] = abs(absolute_differences['Difference'])
+        absolute_differences = absolute_differences.sort_values('AbsDiff', ascending=False)
+        
+        plt.figure(figsize=(10, 6))
+        plt.bar(absolute_differences['Trait'], absolute_differences['AbsDiff'])
+        plt.title('Absolute Difference from Target Values (Second Round)')
+        plt.xlabel('Trait')
+        plt.ylabel('Absolute Difference')
+        plt.xticks(rotation=45, ha='right')
+        plt.tight_layout()
+        plt.savefig('target_absolute_differences.png')
+        plt.close()
+
+def main(data_path):
+    # Load data
+    data = load_data(data_path)
+    if data is None:
+        print("Failed to load data. Please check the file path and format.")
+        return
+    
+    print(f"Loaded {len(data)} potential breeding pairs")
+    
+    # Run first round optimization
+    first_round, remaining = optimize_breeding_first_round(data)
+    
+    if first_round is None:
+        print("First round optimization failed. Exiting.")
+        return
+    
+    # Run second round optimization
+    try:
+        second_round = optimize_breeding_second_round(remaining, first_round)
+    except KeyError as e:
+        print(f"KeyError encountered in second round: {e}")
+        print("Proceeding with only first round results")
+        second_round = None
+    except Exception as e:
+        print(f"Error in second round optimization: {e}")
+        print("Proceeding with only first round results")
+        second_round = None
+    
+    # Analyze results
+    analyze_results(first_round, second_round)
+    
+    print("\nOptimization complete!")
+    print(f"Selected {len(first_round)} pairs in first round")
+    if second_round is not None:
+        print(f"Selected {len(second_round)} pairs in second round")
+    print(f"Total pairs selected: {len(first_round) + (len(second_round) if second_round is not None else 0)}")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python cattle_optimization.py <data_file_path>")
+        data_path = '2025cow.csv'  # Default file if not provided
+        print(f"No file specified, using default: {data_path}")
+    else:
+        data_path = sys.argv[1]
+    
+
+
+```
+
+
+```{python}
+import pandas as pd
+import numpy as np
+from ortools.sat.python import cp_model
+import matplotlib.pyplot as plt
+import sys
+
+# Constants for the optimization
+MINIMIZE_TRAITS = ['ME', 'BW', 'YG', 'DMI', 'FAT']
+DESCRIPTIVE_COLS = ["AnimalID", "RAAA#", "Sex", "Name", "DOB", "BrdCds"]
+NUM_PAIRS_FIRST_ROUND = 50
+MAX_BULL_USES = 23  # Hard maximum for bull usage
+SPECIAL_BULL_LIMIT = {"8269": 10}  # Special limit for bull 8269
+
+# Target values for second round
+TARGET_VALUES = {
+    'CED': 14, 'BW': -3, 'WW': 65, 'YW': 100, 'ADG': 0.28,
+    'DMI': 0.6, 'Milk': 29, 'ME': -2, 'HPG': 12, 'CEM': 8,
+    'STAY': 18, 'Marb': 0.5, 'YG': 0.03, 'CW': 29, 'REA': 0.17,
+    'FAT': 0, 'HB': 70, 'GM': 46
+}
+
+# Weight factors for traits
+WEIGHT_FACTORS = {
+    'ME': 1.5,  # Higher weight for ME
+    'BW': 1.0,
+    'YG': 1.0,
+    'DMI': 1.0,
+    'FAT': 1.0
+}
+
+def extract_ids(animal_id):
+    """Extract cow ID and bull ID from the AnimalID column"""
+    if pd.isna(animal_id):
+        return None, None
+    
+    # Split on hyphen to extract cow and bull IDs from format like "C17 - 9191G"
+    parts = str(animal_id).split('-')
+    if len(parts) == 2:
+        cow_id = parts[0].strip()
+        bull_id = parts[1].strip()
+        return cow_id, bull_id
+    else:
+        return str(animal_id).strip(), None
+
+def load_data(file_path):
+    """Load the cattle pairing data from CSV or Excel"""
+    try:
+        if file_path.endswith('.csv'):
+            return pd.read_csv(file_path)
+        elif file_path.endswith(('.xlsx', '.xls')):
+            return pd.read_excel(file_path)
+        else:
+            raise ValueError("Unsupported file format. Please provide CSV or Excel file.")
+    except Exception as e:
+        print(f"Error loading data: {e}")
+        return None
+
+def optimize_breeding_first_round(data, num_pairs=NUM_PAIRS_FIRST_ROUND):
+    """
+    Optimize breeding pairs to minimize certain traits and maximize others.
+    With extra emphasis on minimizing ME.
+    
+    Args:
+        data: DataFrame with pre-calculated EPDs for potential breeding pairs
+        num_pairs: Number of pairs to select
+        
+    Returns:
+        Selected pairs DataFrame and remaining pairs DataFrame
+    """
+    # Add extracted cow and bull ID columns
+    cow_bull_ids = data['AnimalID'].apply(extract_ids)
+    data['CowID'] = [x[0] for x in cow_bull_ids]
+    data['BullID'] = [x[1] for x in cow_bull_ids]
+    
+    # Use the hard maximum for bull uses
+    print(f"Total unique cows: {len(data['CowID'].unique())}")
+    print(f"Max uses per bull: {MAX_BULL_USES}")
+    print(f"Special limit for bull 8269: {SPECIAL_BULL_LIMIT['8269']}")
+    
+    # Identify maximize traits (all numeric traits except those to minimize and descriptive columns)
+    numeric_cols = data.select_dtypes(include=[np.number]).columns.tolist()
+    maximize_traits = [col for col in numeric_cols if col not in MINIMIZE_TRAITS and col not in DESCRIPTIVE_COLS]
+    
+    print(f"Minimizing traits: {MINIMIZE_TRAITS}")
+    print(f"Maximizing traits: {maximize_traits}")
+    print(f"Special emphasis on minimizing ME (weight factor: {WEIGHT_FACTORS['ME']})")
+    
+    # Create CP-SAT model
+    model = cp_model.CpModel()
+    
+    # Create decision variables: 1 if pair i is selected, 0 otherwise
+    pair_vars = {}
+    for i in range(len(data)):
+        pair_vars[i] = model.NewBoolVar(f'pair_{i}')
+    
+    # Constraint: Select exactly num_pairs pairs (or fewer if not enough unique cows)
+    total_cows = len(data['CowID'].unique())
+    num_pairs_to_select = min(num_pairs, total_cows)
+    model.Add(sum(pair_vars.values()) == num_pairs_to_select)
+    
+    # Constraint: Each cow can only be used once
+    cow_indices = {}
+    for i, row in data.iterrows():
+        cow_id = row['CowID']
+        if cow_id not in cow_indices:
+            cow_indices[cow_id] = []
+        cow_indices[cow_id].append(i)
+    
+    for cow_id, indices in cow_indices.items():
+        model.Add(sum(pair_vars[i] for i in indices) <= 1)
+    
+    # Constraint: Each bull can be used at most MAX_BULL_USES times
+    bull_indices = {}
+    for i, row in data.iterrows():
+        bull_id = row['BullID']
+        if pd.notna(bull_id):
+            if bull_id not in bull_indices:
+                bull_indices[bull_id] = []
+            bull_indices[bull_id].append(i)
+    
+    for bull_id, indices in bull_indices.items():
+        # Check if this bull has a special limit
+        if bull_id in SPECIAL_BULL_LIMIT:
+            max_uses = SPECIAL_BULL_LIMIT[bull_id]
+            print(f"Applying special limit of {max_uses} for bull {bull_id}")
+        else:
+            max_uses = MAX_BULL_USES
+            
+        model.Add(sum(pair_vars[i] for i in indices) <= max_uses)
+    
+    # Objective: Weighted sum of traits (minimize bad traits, maximize good traits)
+    objective_terms = []
+    
+    # Normalize trait values for better balancing in the objective function
+    normalized_data = data.copy()
+    
+    for trait in MINIMIZE_TRAITS + maximize_traits:
+        if trait in data.columns:
+            # Skip if all values are the same (would cause div by zero)
+            if data[trait].max() == data[trait].min():
+                normalized_data[f'norm_{trait}'] = 0
+                continue
+                
+            # Min-max normalization to [0,1]
+            normalized_data[f'norm_{trait}'] = (data[trait] - data[trait].min()) / (data[trait].max() - data[trait].min())
+    
+    # Create objective terms
+    for i in range(len(data)):
+        # Minimize bad traits with weights
+        for trait in MINIMIZE_TRAITS:
+            norm_trait = f'norm_{trait}'
+            if norm_trait in normalized_data.columns:
+                # Apply weight factor for this trait (default to 1.0 if not specified)
+                weight = WEIGHT_FACTORS.get(trait, 1.0)
+                objective_terms.append(weight * normalized_data.iloc[i][norm_trait] * pair_vars[i])
+        
+        # Maximize good traits (negate for minimization problem)
+        for trait in maximize_traits:
+            norm_trait = f'norm_{trait}'
+            if norm_trait in normalized_data.columns:
+                weight = WEIGHT_FACTORS.get(trait,1.0)
+                objective_terms.append(-weight * normalized_data.iloc[i][norm_trait] * pair_vars[i])
+    
+    # Set objective
+    model.Minimize(sum(objective_terms))
+    
+    # Solve
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = 300  # 5 minute time limit
+    status = solver.Solve(model)
+    
+    # Process results
+    if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
+        print(f"Solution found with status: {solver.StatusName(status)}")
+        
+        # Get selected pairs
+        selected_indices = []
+        for i in range(len(data)):
+            if solver.Value(pair_vars[i]) == 1:
+                selected_indices.append(i)
+        
+        selected_pairs = data.iloc[selected_indices].copy()
+        remaining_pairs = data.drop(selected_indices).copy()
+        
+        print(f"Selected {len(selected_pairs)} pairs in first round")
+        print(f"{len(remaining_pairs)} pairs remaining for second round")
+        
+        # Verify constraints
+        used_cows = selected_pairs['CowID'].tolist()
+        used_bulls = selected_pairs['BullID'].value_counts().to_dict()
+        
+        print(f"Number of unique cows used: {len(set(used_cows))}")
+        print(f"Maximum bull usage: {max(used_bulls.values()) if used_bulls else 0}")
+        
+        # Check special bull limit
+        for bull_id, limit in SPECIAL_BULL_LIMIT.items():
+            actual_uses = used_bulls.get(bull_id, 0)
+            print(f"Bull {bull_id} usage: {actual_uses}/{limit}")
+        
+        return selected_pairs, remaining_pairs
+    else:
+        print(f"No solution found. Status: {solver.StatusName(status)}")
+        return None, data
+
+def optimize_breeding_second_round(remaining_data, first_round_selections):
+    """
+    Second round optimization to maximize total metrics above target values,
+    but only selecting pairs where ME ≤ 0 and CED ≥ 14.
+    """
+    if len(remaining_data) == 0:
+        print("No remaining pairs for second round")
+        return None
+    
+    # Reset index of remaining_data to ensure we don't have any index gaps
+    remaining_data = remaining_data.reset_index(drop=True)
+    
+    # Extract cow and bull IDs if not already available
+    if 'CowID' not in remaining_data.columns or 'BullID' not in remaining_data.columns:
+        cow_bull_ids = remaining_data['AnimalID'].apply(extract_ids)
+        remaining_data['CowID'] = [x[0] for x in cow_bull_ids]
+        remaining_data['BullID'] = [x[1] for x in cow_bull_ids]
+    
+    # Get already used cows from first round
+    used_cows = first_round_selections['CowID'].unique().tolist()
+    
+    # Count bull uses from first round
+    bull_usage = first_round_selections['BullID'].value_counts().to_dict()
+    
+    # Filter remaining data to only include pairs where ME ≤ 0 and CED ≥ 14
+    valid_rows = (remaining_data['ME'] <= 0) & (remaining_data['CED'] >= 13)
+    
+    # Check if we have any valid pairs after filtering
+    if not valid_rows.any():
+        print("No pairs meet the required ME ≤ 0 and CED ≥ 14 criteria")
+        return pd.DataFrame()
+    
+    # Filter the data
+    filtered_data = remaining_data[valid_rows].reset_index(drop=True)
+    print(f"Found {len(filtered_data)} pairs meeting ME ≤ 0 and CED ≥ 14 criteria")
+    
+    # Create CP-SAT model
+    model = cp_model.CpModel()
+    
+    # Create decision variables: 1 if pair i is selected, 0 otherwise
+    pair_vars = {}
+    for i in range(len(filtered_data)):
+        # Only create variables for pairs with unused cows
+        if filtered_data.iloc[i]['CowID'] not in used_cows:
+            pair_vars[i] = model.NewBoolVar(f'pair_{i}')
+    
+    # If no valid pairs remain, return empty result
+    if not pair_vars:
+        print("No valid pairs remain for second round (all cows used or don't meet criteria)")
+        return pd.DataFrame()
+    
+    # Constraint: Each cow can only be used once
+    cow_indices = {}
+    for i in pair_vars:
+        cow_id = filtered_data.iloc[i]['CowID']
+        if cow_id not in cow_indices:
+            cow_indices[cow_id] = []
+        cow_indices[cow_id].append(i)
+    
+    for cow_id, indices in cow_indices.items():
+        model.Add(sum(pair_vars[i] for i in indices) <= 1)
+    
+    # Constraint: Each bull can be used at most MAX_BULL_USES times (considering first round usage)
+    # With special handling for bull 8269
+    bull_indices = {}
+    for i in pair_vars:
+        bull_id = filtered_data.iloc[i]['BullID']
+        if pd.notna(bull_id):
+            if bull_id not in bull_indices:
+                bull_indices[bull_id] = []
+            bull_indices[bull_id].append(i)
+    
+    for bull_id, indices in bull_indices.items():
+        previous_uses = bull_usage.get(bull_id, 0)
+        
+        # Check if this bull has a special limit
+        if bull_id in SPECIAL_BULL_LIMIT:
+            max_total_uses = SPECIAL_BULL_LIMIT[bull_id]
+        else:
+            max_total_uses = MAX_BULL_USES
+            
+        remaining_uses = max_total_uses - previous_uses
+        
+        if remaining_uses <= 0:
+            # If bull reached limit, don't use again
+            for i in indices:
+                model.Add(pair_vars[i] == 0)
+        else:
+            # Limit remaining uses
+            model.Add(sum(pair_vars[i] for i in indices) <= remaining_uses)
+    
+    # Objective: Maximize the total count of metrics above target values
+    # For each pair, we'll count how many traits exceed their target values
+    above_target_terms = []
+    
+    # Determine which traits should be higher or lower than target
+    higher_is_better_traits = [t for t in TARGET_VALUES.keys() if t not in ['BW', 'ME', 'DMI', 'YG', 'FAT']]
+    lower_is_better_traits = ['BW', 'ME', 'DMI', 'YG', 'FAT']
+    
+    # Add objective terms for each valid pair
+    for i in pair_vars:
+        # For each higher-is-better trait, count if it's above target
+        for trait in higher_is_better_traits:
+            if trait in filtered_data.columns:
+                trait_value = filtered_data.iloc[i][trait]
+                target = TARGET_VALUES.get(trait, 0)
+                
+                if trait_value >= target:
+                    # Add 1 to count if above target (negative for minimization problem)
+                    above_target_terms.append(-1 * pair_vars[i])  # Negative because we're minimizing
+        
+        # For each lower-is-better trait, count if it's below target
+        for trait in lower_is_better_traits:
+            if trait in filtered_data.columns:
+                trait_value = filtered_data.iloc[i][trait]
+                target = TARGET_VALUES.get(trait, 0)
+                
+                if trait_value <= target:
+                    # Add 1 to count if below target (negative for minimization problem)
+                    above_target_terms.append(-1 * pair_vars[i])  # Negative because we're minimizing
+    
+    # Objective part 1: Maximize number of valid pairs selected
+    pair_count_expr = sum(pair_vars.values())
+    
+    # Set objective: First maximize number of pairs, then maximize traits meeting targets
+    # We scale the objectives to ensure pair count takes priority
+    scaling_factor = 1000  # Large enough to ensure pair count takes priority
+    
+    # Set objective to minimize negative counts (equivalent to maximizing)
+    model.Minimize(-scaling_factor * pair_count_expr + sum(above_target_terms))
+    
+    # Solve
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = 300  # 5 minute time limit
+    status = solver.Solve(model)
+    
+    # Process results
+    if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
+        print(f"Solution found with status: {solver.StatusName(status)}")
+        
+        # Get selected pairs
+        selected_indices = []
+        for i in pair_vars:
+            if solver.Value(pair_vars[i]) == 1:
+                selected_indices.append(i)
+        
+        second_round_selections = filtered_data.iloc[selected_indices].copy()
+        
+        print(f"Selected {len(second_round_selections)} pairs in second round")
+        
+        # Verify constraints
+        round2_used_cows = second_round_selections['CowID'].tolist()
+        round2_used_bulls = second_round_selections['BullID'].value_counts().to_dict()
+        
+        # Check for cow overlap between rounds
+        common_cows = set(used_cows).intersection(set(round2_used_cows))
+        if common_cows:
+            print(f"WARNING: Found {len(common_cows)} cows used in both rounds!")
+        
+        print(f"Number of unique cows used in round 2: {len(set(round2_used_cows))}")
+        print(f"Maximum bull usage in round 2: {max(round2_used_bulls.values()) if round2_used_bulls else 0}")
+        
+        # Check special bull limit for both rounds combined
+        for bull_id, limit in SPECIAL_BULL_LIMIT.items():
+            round1_uses = bull_usage.get(bull_id, 0)
+            round2_uses = round2_used_bulls.get(bull_id, 0)
+            total_uses = round1_uses + round2_uses
+            print(f"Bull {bull_id} total usage: {total_uses}/{limit} (Round 1: {round1_uses}, Round 2: {round2_uses})")
+        
+        # Verify all selected pairs meet ME ≤ 0 and CED ≥ 14
+        me_check = (second_round_selections['ME'] <= 0).all()
+        ced_check = (second_round_selections['CED'] >= 14).all()
+        
+        if me_check and ced_check:
+            print("CONFIRMED: All selected pairs meet ME ≤ 0 and CED ≥ 14 criteria")
+        else:
+            print("WARNING: Some selected pairs don't meet the criteria!")
+            print(f"  Pairs with ME > 0: {(second_round_selections['ME'] > 0).sum()}")
+            print(f"  Pairs with CED < 14: {(second_round_selections['CED'] < 14).sum()}")
+        
+        # Calculate and display target achievement stats
+        print("\nTarget achievement summary:")
+        above_target_count = {}
+        
+        for trait, target in TARGET_VALUES.items():
+            if trait in second_round_selections.columns:
+                if trait in higher_is_better_traits:
+                    above_count = (second_round_selections[trait] >= target).sum()
+                    print(f"{trait}: {above_count}/{len(second_round_selections)} pairs above target {target}")
+                    above_target_count[trait] = above_count
+                else:
+                    below_count = (second_round_selections[trait] <= target).sum()
+                    print(f"{trait}: {below_count}/{len(second_round_selections)} pairs below target {target}")
+                    above_target_count[trait] = below_count
+        
+        return second_round_selections
+    else:
+        print(f"No solution found for second round. Status: {solver.StatusName(status)}")
+        return None
+
+def analyze_results(first_round, second_round=None):
+    """Analyze and visualize optimization results"""
+    # Combine results if we have both rounds
+    if second_round is not None and len(second_round) > 0:
+        all_results = pd.concat([first_round, second_round], ignore_index=True)
+        all_results['Round'] = [1] * len(first_round) + [2] * len(second_round)
+    else:
+        all_results = first_round.copy()
+        all_results['Round'] = 1
+    
+    # Save full results
+    all_results.to_csv('breeding_optimization_results4.csv', index=False)
+    print("Full results saved to 'breeding_optimization_results.csv'")
+    
+    # Verify each cow is used only once
+    cow_counts = all_results['CowID'].value_counts()
+    if (cow_counts > 1).any():
+        print("WARNING: Some cows were used more than once!")
+        print(cow_counts[cow_counts > 1])
+    else:
+        print("VERIFIED: Each cow is used exactly once.")
+    
+    # Verify bull usage constraint
+    bull_counts = all_results['BullID'].value_counts()
+    
+    if (bull_counts > MAX_BULL_USES).any():
+        print(f"WARNING: Some bulls were used more than the maximum allowed ({MAX_BULL_USES})!")
+        print(bull_counts[bull_counts > MAX_BULL_USES])
+    else:
+        print(f"VERIFIED: No bull is used more than {MAX_BULL_USES} times.")
+    
+    # Verify special bull limits
+    for bull_id, limit in SPECIAL_BULL_LIMIT.items():
+        if bull_id in bull_counts:
+            actual_uses = bull_counts[bull_id]
+            if actual_uses > limit:
+                print(f"WARNING: Bull {bull_id} used {actual_uses} times, exceeding special limit of {limit}!")
+            else:
+                print(f"VERIFIED: Bull {bull_id} used {actual_uses} times, within special limit of {limit}.")
+    
+    # Summarize bull usage
+    bull_usage = all_results['BullID'].value_counts().reset_index()
+    bull_usage.columns = ['Bull_ID', 'Usage_Count']
+    bull_usage = bull_usage.sort_values('Usage_Count', ascending=False)
+    bull_usage.to_csv('bull_usage_summary.csv', index=False)
+    print("Bull usage summary saved to 'bull_usage_summary.csv'")
+    
+    # Calculate trait averages for each round
+    trait_cols = [col for col in all_results.columns 
+                 if col not in DESCRIPTIVE_COLS + ['Round', 'CowID', 'BullID']]
+    
+    print("\nTrait averages by round:")
+    round_averages = all_results.groupby('Round')[trait_cols].mean()
+    print(round_averages)
+    
+    # Save round averages
+    round_averages.to_csv('trait_averages_by_round.csv')
+    
+    # Create visualizations
+    create_visualizations(all_results, trait_cols)
+    
+    return all_results
+
+def create_visualizations(results, trait_cols):
+    """Create various visualizations of the results"""
+    # 1. Bull usage chart
+    bull_usage = results['BullID'].value_counts()
+    plt.figure(figsize=(12, 6))
+    bull_usage.plot(kind='bar')
+    plt.title('Number of Times Each Bull is Used')
+    plt.xlabel('Bull ID')
+    plt.ylabel('Count')
+    plt.tight_layout()
+    plt.savefig('bull_usage.png')
+    plt.close()
+    
+    # 2. Trait distributions by round
+    # Select important traits to visualize (minimize and some key maximize traits)
+    key_traits = MINIMIZE_TRAITS + ['CED', 'WW', 'YW', 'Marb', 'REA']
+    key_traits = [t for t in key_traits if t in trait_cols]
+    
+    # Create subplots for each trait
+    fig, axes = plt.subplots(nrows=len(key_traits), ncols=1, figsize=(10, 3*len(key_traits)))
+    
+    if len(key_traits) == 1:
+        axes = [axes]  # Make iterable if only one subplot
+        
+    for i, trait in enumerate(key_traits):
+        if 'Round' in results.columns and len(results['Round'].unique()) > 1:
+            # If we have multiple rounds, show histograms by round
+            for round_num in sorted(results['Round'].unique()):
+                round_data = results[results['Round'] == round_num]
+                axes[i].hist(round_data[trait], alpha=0.5, label=f'Round {round_num}')
+            axes[i].legend()
+        else:
+            axes[i].hist(results[trait])
+            
+        axes[i].set_title(f'Distribution of {trait}')
+        axes[i].set_xlabel(trait)
+        axes[i].set_ylabel('Count')
+    
+    plt.tight_layout()
+    plt.savefig('trait_distributions.png')
+    plt.close()
+    
+    # 3. Comparison between rounds
+    if 'Round' in results.columns and len(results['Round'].unique()) > 1:
+        round_means = results.groupby('Round')[key_traits].mean()
+        
+        fig, ax = plt.subplots(figsize=(12, 8))
+        round_means.plot(kind='bar', ax=ax)
+        plt.title('Average Trait Values by Round')
+        plt.ylabel('Value')
+        plt.legend(title='Trait')
+        plt.tight_layout()
+        plt.savefig('round_comparison.png')
+        plt.close()
+    
+    # 4. Comparison to target values (second round)
+    if 'Round' in results.columns and 2 in results['Round'].values:
+        second_round_data = results[results['Round'] == 2]
+        
+        # Calculate distances to targets
+        target_comparisons = []
+        
+        for trait, target in TARGET_VALUES.items():
+            if trait in second_round_data.columns:
+                avg_value = second_round_data[trait].mean()
+                target_comparisons.append({
+                    'Trait': trait,
+                    'Target': target,
+                    'Achieved': avg_value,
+                    'Difference': avg_value - target
+                })
+        
+        target_df = pd.DataFrame(target_comparisons)
+        target_df.to_csv('target_comparison.csv', index=False)
+        
+        # Create bar chart showing achievement vs targets
+        plt.figure(figsize=(12, 8))
+        traits = target_df['Trait'].tolist()
+        x = np.arange(len(traits))
+        width = 0.35
+        
+        plt.bar(x - width/2, target_df['Target'], width, label='Target')
+        plt.bar(x + width/2, target_df['Achieved'], width, label='Achieved')
+        
+        plt.title('Target vs Achieved Values (Second Round)')
+        plt.xticks(x, traits, rotation=45, ha='right')
+        plt.ylabel('Value')
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig('target_comparison.png')
+        plt.close()
+        
+        # 5. Create a heat map of trait differences from targets
+        absolute_differences = target_df.copy()
+        absolute_differences['AbsDiff'] = abs(absolute_differences['Difference'])
+        absolute_differences = absolute_differences.sort_values('AbsDiff', ascending=False)
+        
+        plt.figure(figsize=(10, 6))
+        plt.bar(absolute_differences['Trait'], absolute_differences['AbsDiff'])
+        plt.title('Absolute Difference from Target Values (Second Round)')
+        plt.xlabel('Trait')
+        plt.ylabel('Absolute Difference')
+        plt.xticks(rotation=45, ha='right')
+        plt.tight_layout()
+        plt.savefig('target_absolute_differences.png')
+        plt.close()
+
+def main(data_path):
+    # Load data
+    data = load_data(data_path)
+    if data is None:
+        print("Failed to load data. Please check the file path and format.")
+        return
+    
+    print(f"Loaded {len(data)} potential breeding pairs")
+    
+    # Run first round optimization
+    first_round, remaining = optimize_breeding_first_round(data)
+    
+    if first_round is None:
+        print("First round optimization failed. Exiting.")
+        return
+    
+    # Run second round optimization
+    try:
+        second_round = optimize_breeding_second_round(remaining, first_round)
+    except KeyError as e:
+        print(f"KeyError encountered in second round: {e}")
+        print("Proceeding with only first round results")
+        second_round = None
+    except Exception as e:
+        print(f"Error in second round optimization: {e}")
+        print("Proceeding with only first round results")
+        second_round = None
+    
+    # Analyze results
+    analyze_results(first_round, second_round)
+    
+    print("\nOptimization complete!")
+    print(f"Selected {len(first_round)} pairs in first round")
+    if second_round is not None:
+        print(f"Selected {len(second_round)} pairs in second round")
+    print(f"Total pairs selected: {len(first_round) + (len(second_round) if second_round is not None else 0)}")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python cattle_optimization.py <data_file_path>")
+        data_path = '2025cow.csv'  # Default file if not provided
+        print(f"No file specified, using default: {data_path}")
+    else:
+        data_path = sys.argv[1]
+
+
+```
+
+```{python}
+def optimize_breeding_in_batches(data, batch_size=23):
+    """
+    Optimize breeding pairs in batches of cows instead of all at once.
+    
+    Args:
+        data: DataFrame with pre-calculated EPDs for potential breeding pairs
+        batch_size: Number of pairs to select in each batch
+        
+    Returns:
+        DataFrame with all selected pairs
+    """
+    # Add extracted cow and bull ID columns if not already present
+    if 'CowID' not in data.columns or 'BullID' not in data.columns:
+        cow_bull_ids = data['AnimalID'].apply(extract_ids)
+        data['CowID'] = [x[0] for x in cow_bull_ids]
+        data['BullID'] = [x[1] for x in cow_bull_ids]
+    
+    # Get unique cow IDs to divide into batches
+    unique_cows = data['CowID'].unique()
+    print(f"Total unique cows: {len(unique_cows)}")
+    
+    # Calculate number of batches needed
+    num_batches = max(1, len(unique_cows) // batch_size + (1 if len(unique_cows) % batch_size != 0 else 0))
+    print(f"Processing in {num_batches} batches of approximately {batch_size} cows each")
+    
+    # Initialize collections for results
+    all_selected_pairs = []
+    used_cows = set()
+    bull_usage_counter = {}
+    
+    # Process each batch
+    for batch_num in range(num_batches):
+        print(f"\n--- Processing Batch {batch_num + 1}/{num_batches} ---")
+        
+        # Determine start and end index for this batch
+        start_idx = batch_num * batch_size
+        end_idx = min(start_idx + batch_size, len(unique_cows))
+        batch_cows = unique_cows[start_idx:end_idx]
+        print(f"Processing cows {start_idx + 1} to {end_idx} ({len(batch_cows)} cows)")
+        
+        # Filter data to only include pairs with cows from this batch
+        batch_data = data[data['CowID'].isin(batch_cows) & ~data['CowID'].isin(used_cows)].copy()
+        
+        # Skip batch if no valid pairs remain
+        if len(batch_data) == 0:
+            print(f"No valid pairs found for batch {batch_num + 1}, skipping")
+            continue
+            
+        print(f"Found {len(batch_data)} potential pairs with {len(batch_data['CowID'].unique())} unique cows")
+        
+        # Create CP-SAT model
+        model = cp_model.CpModel()
+        
+        # Create decision variables: 1 if pair i is selected, 0 otherwise
+        pair_vars = {}
+        for i in range(len(batch_data)):
+            pair_vars[i] = model.NewBoolVar(f'pair_{i}')
+        
+        # Constraint: Each cow can only be used once
+        cow_indices = {}
+        for i, row in batch_data.iterrows():
+            cow_id = row['CowID']
+            if cow_id not in cow_indices:
+                cow_indices[cow_id] = []
+            cow_indices[cow_id].append(i - batch_data.index[0])  # Adjust index to match batch_data
+        
+        for cow_id, indices in cow_indices.items():
+            model.Add(sum(pair_vars[i] for i in indices) <= 1)
+        
+        # Constraint: Each bull usage respects global limits
+        bull_indices = {}
+        for i, row in batch_data.iterrows():
+            bull_id = row['BullID']
+            if pd.notna(bull_id):
+                if bull_id not in bull_indices:
+                    bull_indices[bull_id] = []
+                bull_indices[bull_id].append(i - batch_data.index[0])  # Adjust index to match batch_data
+        
+        for bull_id, indices in bull_indices.items():
+            # Check if this bull has a special limit
+            if bull_id in SPECIAL_BULL_LIMIT:
+                max_uses = SPECIAL_BULL_LIMIT[bull_id]
+            else:
+                max_uses = MAX_BULL_USES
+                
+            # Consider existing bull usage from previous batches
+            previous_uses = bull_usage_counter.get(bull_id, 0)
+            remaining_uses = max_uses - previous_uses
+            
+            if remaining_uses <= 0:
+                # If bull reached limit, don't use again
+                for i in indices:
+                    model.Add(pair_vars[i] == 0)
+            else:
+                # Limit remaining uses
+                model.Add(sum(pair_vars[i] for i in indices) <= remaining_uses)
+        
+        # Objective: Weighted sum of traits (minimize bad traits, maximize good traits)
+        objective_terms = []
+        
+        # Normalize trait values for better balancing in the objective function
+        normalized_data = batch_data.copy()
+        
+        for trait in MINIMIZE_TRAITS + [col for col in batch_data.select_dtypes(include=[np.number]).columns 
+                                        if col not in MINIMIZE_TRAITS and col not in DESCRIPTIVE_COLS]:
+            if trait in batch_data.columns:
+                # Skip if all values are the same (would cause div by zero)
+                if batch_data[trait].max() == batch_data[trait].min():
+                    normalized_data[f'norm_{trait}'] = 0
+                    continue
+                    
+                # Min-max normalization to [0,1]
+                normalized_data[f'norm_{trait}'] = (batch_data[trait] - batch_data[trait].min()) / (batch_data[trait].max() - batch_data[trait].min())
+        
+        # Create objective terms
+        for i in range(len(batch_data)):
+            idx = i  # Index in the batch data
+            
+            # Minimize bad traits with weights
+            for trait in MINIMIZE_TRAITS:
+                norm_trait = f'norm_{trait}'
+                if norm_trait in normalized_data.columns:
+                    # Apply weight factor for this trait (default to 1.0 if not specified)
+                    weight = WEIGHT_FACTORS.get(trait, 1.0)
+                    objective_terms.append(weight * normalized_data.iloc[idx][norm_trait] * pair_vars[i])
+            
+            # Maximize good traits (negate for minimization problem)
+            maximize_traits = [col for col in normalized_data.columns 
+                              if col.startswith('norm_') and col[5:] not in MINIMIZE_TRAITS]
+            
+            for norm_trait in maximize_traits:
+                trait = norm_trait[5:]  # Strip 'norm_' prefix
+                weight = WEIGHT_FACTORS.get(trait, 1.0)
+                objective_terms.append(-weight * normalized_data.iloc[idx][norm_trait] * pair_vars[i])
+        
+        # Set objective
+        model.Minimize(sum(objective_terms))
+        
+        # Solve
+        solver = cp_model.CpSolver()
+        solver.parameters.max_time_in_seconds = 300  # 5 minute time limit
+        status = solver.Solve(model)
+        
+        # Process results
+        if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
+            print(f"Solution found with status: {solver.StatusName(status)}")
+            
+            # Get selected pairs
+            selected_indices = []
+            for i in range(len(batch_data)):
+                if solver.Value(pair_vars[i]) == 1:
+                    selected_indices.append(batch_data.index[i])
+            
+            selected_batch_pairs = data.loc[selected_indices].copy()
+            print(f"Selected {len(selected_batch_pairs)} pairs in batch {batch_num + 1}")
+            
+            # Update tracking data
+            for cow_id in selected_batch_pairs['CowID'].unique():
+                used_cows.add(cow_id)
+                
+            for bull_id, count in selected_batch_pairs['BullID'].value_counts().items():
+                bull_usage_counter[bull_id] = bull_usage_counter.get(bull_id, 0) + count
+                
+            # Add batch results to overall results
+            all_selected_pairs.append(selected_batch_pairs)
+            
+            # Print bull usage summary for this batch
+            batch_bull_usage = selected_batch_pairs['BullID'].value_counts().to_dict()
+            print("Bull usage in this batch:")
+            for bull_id, count in batch_bull_usage.items():
+                total_usage = bull_usage_counter[bull_id]
+                limit = SPECIAL_BULL_LIMIT.get(bull_id, MAX_BULL_USES)
+                print(f"  Bull {bull_id}: {count} (total now: {total_usage}/{limit})")
+                
+        else:
+            print(f"No solution found for batch {batch_num + 1}. Status: {solver.StatusName(status)}")
+    
+    # Combine all selected pairs
+    if all_selected_pairs:
+        combined_results = pd.concat(all_selected_pairs, ignore_index=True)
+        print(f"\nTotal pairs selected across all batches: {len(combined_results)}")
+        
+        # Verify constraints
+        cow_counts = combined_results['CowID'].value_counts()
+        if (cow_counts > 1).any():
+            print("WARNING: Some cows were used more than once!")
+            print(cow_counts[cow_counts > 1])
+        else:
+            print("VERIFIED: Each cow is used exactly once.")
+        
+        bull_counts = combined_results['BullID'].value_counts()
+        for bull_id, count in bull_counts.items():
+            limit = SPECIAL_BULL_LIMIT.get(bull_id, MAX_BULL_USES)
+            if count > limit:
+                print(f"WARNING: Bull {bull_id} used {count} times, exceeding limit of {limit}!")
+            
+        return combined_results
+    else:
+        print("No pairs were selected across all batches")
+        return pd.DataFrame()
+
+
+# Modify the main function to use the batch optimization
+def main_with_batches(data_path, batch_size=23):
+    # Load data
+    data = load_data(data_path)
+    if data is None:
+        print("Failed to load data. Please check the file path and format.")
+        return
+    
+    print(f"Loaded {len(data)} potential breeding pairs")
+    
+    # Run optimization in batches
+    selected_pairs = optimize_breeding_in_batches(data, batch_size=batch_size)
+    
+    if len(selected_pairs) > 0:
+        # Analyze results
+        selected_pairs['Round'] = 1  # Mark all as first round for consistency with existing analysis
+        analyze_results(selected_pairs)
+        
+        # Save results
+        selected_pairs.to_csv('batch_optimization_results.csv', index=False)
+        print("Results saved to 'batch_optimization_results.csv'")
+    else:
+        print("Optimization failed to produce any valid pairs.")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python cattle_optimization.py <data_file_path> [batch_size]")
+        data_path = '2025cow.csv'  # Default file if not provided
+        print(f"No file specified, using default: {data_path}")
+    else:
+        data_path = sys.argv[1]
+        
+    # Optional batch size parameter
+    batch_size = 23
+    if len(sys.argv) >= 3:
+        try:
+            batch_size = int(sys.argv[2])
+            print(f"Using batch size: {batch_size}")
+        except ValueError:
+            print(f"Invalid batch size provided, using default: {batch_size}")
+    
+    
+
+```
+
+```{python}
+#Batches and optimize by totals above target values
+def optimize_breeding_in_batches(data, batch_size=23):
+    """
+    Optimize breeding pairs in batches of cows instead of all at once.
+    Optimization focuses on maximizing the number of traits that meet or exceed target values.
+    
+    Args:
+        data: DataFrame with pre-calculated EPDs for potential breeding pairs
+        batch_size: Number of pairs to select in each batch
+        
+    Returns:
+        DataFrame with all selected pairs
+    """
+    # Define target values for traits
+    TARGET_VALUES = {
+        'PROS': 118,'CED': 14, 'BW': -3, 'WW': 65, 'YW': 100, 'ADG': 0.28,
+        'DMI': 0.6, 'Milk': 29, 'ME': -2, 'HPG': 12, 'CEM': 8,
+        'STAY': 18, 'Marb': 0.5, 'YG': 0.03, 'CW': 29, 'REA': 0.17,
+        'FAT': 0, 'HB': 70, 'GM': 46
+    }
+    
+    # Determine which traits should be higher or lower than target
+    # For most traits, higher is better (≥ target)
+    # For some traits, lower is better (≤ target)
+    LOWER_IS_BETTER = ['BW', 'ME', 'DMI', 'YG', 'FAT']
+    
+    # Add extracted cow and bull ID columns if not already present
+    if 'CowID' not in data.columns or 'BullID' not in data.columns:
+        cow_bull_ids = data['AnimalID'].apply(extract_ids)
+        data['CowID'] = [x[0] for x in cow_bull_ids]
+        data['BullID'] = [x[1] for x in cow_bull_ids]
+    
+    # Calculate target achievement for each pair
+    print("Calculating trait target achievements...")
+    data['TargetsAchieved'] = 0
+    
+    for trait, target in TARGET_VALUES.items():
+        if trait in data.columns:
+            if trait in LOWER_IS_BETTER:
+                # For traits where lower is better
+                data[f'{trait}_Achieved'] = (data[trait] <= target).astype(int)
+            else:
+                # For traits where higher is better
+                data[f'{trait}_Achieved'] = (data[trait] >= target).astype(int)
+            
+            # Increment the total count of achieved targets
+            data['TargetsAchieved'] += data[f'{trait}_Achieved']
+    
+    print(f"Target achievement statistics:")
+    print(f"  Average targets achieved: {data['TargetsAchieved'].mean():.2f} out of {len(TARGET_VALUES)}")
+    print(f"  Max targets achieved: {data['TargetsAchieved'].max()} out of {len(TARGET_VALUES)}")
+    print(f"  Min targets achieved: {data['TargetsAchieved'].min()} out of {len(TARGET_VALUES)}")
+    
+    # Get unique cow IDs to divide into batches
+    unique_cows = data['CowID'].unique()
+    print(f"Total unique cows: {len(unique_cows)}")
+    
+    # Calculate number of batches needed
+    num_batches = max(1, len(unique_cows) // batch_size + (1 if len(unique_cows) % batch_size != 0 else 0))
+    print(f"Processing in {num_batches} batches of approximately {batch_size} cows each")
+    
+    # Initialize collections for results
+    all_selected_pairs = []
+    used_cows = set()
+    bull_usage_counter = {}
+    
+    # Process each batch
+    for batch_num in range(num_batches):
+        print(f"\n--- Processing Batch {batch_num + 1}/{num_batches} ---")
+        
+        # Determine start and end index for this batch
+        start_idx = batch_num * batch_size
+        end_idx = min(start_idx + batch_size, len(unique_cows))
+        batch_cows = unique_cows[start_idx:end_idx]
+        print(f"Processing cows {start_idx + 1} to {end_idx} ({len(batch_cows)} cows)")
+        
+        # Filter data to only include pairs with cows from this batch
+        batch_data = data[data['CowID'].isin(batch_cows) & ~data['CowID'].isin(used_cows)].copy()
+        
+        # Skip batch if no valid pairs remain
+        if len(batch_data) == 0:
+            print(f"No valid pairs found for batch {batch_num + 1}, skipping")
+            continue
+            
+        print(f"Found {len(batch_data)} potential pairs with {len(batch_data['CowID'].unique())} unique cows")
+        
+        # Create CP-SAT model
+        model = cp_model.CpModel()
+        
+        # Create decision variables: 1 if pair i is selected, 0 otherwise
+        pair_vars = {}
+        for i in range(len(batch_data)):
+            pair_vars[i] = model.NewBoolVar(f'pair_{i}')
+        
+        # Constraint: Each cow can only be used once
+        cow_indices = {}
+        for i, row in batch_data.iterrows():
+            cow_id = row['CowID']
+            if cow_id not in cow_indices:
+                cow_indices[cow_id] = []
+            cow_indices[cow_id].append(i - batch_data.index[0])  # Adjust index to match batch_data
+        
+        for cow_id, indices in cow_indices.items():
+            model.Add(sum(pair_vars[i] for i in indices) <= 1)
+        
+        # Constraint: Each bull usage respects global limits
+        bull_indices = {}
+        for i, row in batch_data.iterrows():
+            bull_id = row['BullID']
+            if pd.notna(bull_id):
+                if bull_id not in bull_indices:
+                    bull_indices[bull_id] = []
+                bull_indices[bull_id].append(i - batch_data.index[0])  # Adjust index to match batch_data
+        
+        for bull_id, indices in bull_indices.items():
+            # Check if this bull has a special limit
+            if bull_id in SPECIAL_BULL_LIMIT:
+                max_uses = SPECIAL_BULL_LIMIT[bull_id]
+            else:
+                max_uses = MAX_BULL_USES
+                
+            # Consider existing bull usage from previous batches
+            previous_uses = bull_usage_counter.get(bull_id, 0)
+            remaining_uses = max_uses - previous_uses
+            
+            if remaining_uses <= 0:
+                # If bull reached limit, don't use again
+                for i in indices:
+                    model.Add(pair_vars[i] == 0)
+            else:
+                # Limit remaining uses
+                model.Add(sum(pair_vars[i] for i in indices) <= remaining_uses)
+        
+        # Objective: Maximize the number of targets achieved
+        # For each pair, get the TargetsAchieved value and use it in the objective
+        target_achievement_terms = []
+        for i in range(len(batch_data)):
+            idx = i  # Index in the batch data
+            # Negate because we're minimizing in the solver (maximizing the negative)
+            target_achievement_terms.append(-batch_data.iloc[idx]['TargetsAchieved'] * pair_vars[i])
+        
+        # Set objective
+        model.Minimize(sum(target_achievement_terms))
+        
+        # Solve
+        solver = cp_model.CpSolver()
+        solver.parameters.max_time_in_seconds = 300  # 5 minute time limit
+        status = solver.Solve(model)
+        
+        # Process results
+        if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
+            print(f"Solution found with status: {solver.StatusName(status)}")
+            
+            # Get selected pairs
+            selected_indices = []
+            for i in range(len(batch_data)):
+                if solver.Value(pair_vars[i]) == 1:
+                    selected_indices.append(batch_data.index[i])
+            
+            selected_batch_pairs = data.loc[selected_indices].copy()
+            print(f"Selected {len(selected_batch_pairs)} pairs in batch {batch_num + 1}")
+            
+            # Calculate and display target achievement stats for this batch
+            avg_targets = selected_batch_pairs['TargetsAchieved'].mean()
+            print(f"Average targets achieved in this batch: {avg_targets:.2f} out of {len(TARGET_VALUES)}")
+            
+            # Update tracking data
+            for cow_id in selected_batch_pairs['CowID'].unique():
+                used_cows.add(cow_id)
+                
+            for bull_id, count in selected_batch_pairs['BullID'].value_counts().items():
+                bull_usage_counter[bull_id] = bull_usage_counter.get(bull_id, 0) + count
+                
+            # Add batch results to overall results
+            all_selected_pairs.append(selected_batch_pairs)
+            
+            # Print bull usage summary for this batch
+            batch_bull_usage = selected_batch_pairs['BullID'].value_counts().to_dict()
+            print("Bull usage in this batch:")
+            for bull_id, count in batch_bull_usage.items():
+                total_usage = bull_usage_counter[bull_id]
+                limit = SPECIAL_BULL_LIMIT.get(bull_id, MAX_BULL_USES)
+                print(f"  Bull {bull_id}: {count} (total now: {total_usage}/{limit})")
+                
+            # Print target achievement by trait
+            print("\nTarget achievement by trait in this batch:")
+            for trait in TARGET_VALUES.keys():
+                if f'{trait}_Achieved' in selected_batch_pairs.columns:
+                    achieved_count = selected_batch_pairs[f'{trait}_Achieved'].sum()
+                    total_count = len(selected_batch_pairs)
+                    print(f"  {trait}: {achieved_count}/{total_count} pairs ({achieved_count/total_count*100:.1f}%)")
+                
+        else:
+            print(f"No solution found for batch {batch_num + 1}. Status: {solver.StatusName(status)}")
+    
+    # Combine all selected pairs
+    if all_selected_pairs:
+        combined_results = pd.concat(all_selected_pairs, ignore_index=True)
+        print(f"\nTotal pairs selected across all batches: {len(combined_results)}")
+        
+        # Verify constraints
+        cow_counts = combined_results['CowID'].value_counts()
+        if (cow_counts > 1).any():
+            print("WARNING: Some cows were used more than once!")
+            print(cow_counts[cow_counts > 1])
+        else:
+            print("VERIFIED: Each cow is used exactly once.")
+        
+        bull_counts = combined_results['BullID'].value_counts()
+        for bull_id, count in bull_counts.items():
+            limit = SPECIAL_BULL_LIMIT.get(bull_id, MAX_BULL_USES)
+            if count > limit:
+                print(f"WARNING: Bull {bull_id} used {count} times, exceeding limit of {limit}!")
+        
+        # Calculate overall target achievement stats
+        print("\nOverall target achievement stats:")
+        avg_targets = combined_results['TargetsAchieved'].mean()
+        print(f"Average targets achieved: {avg_targets:.2f} out of {len(TARGET_VALUES)}")
+        print(f"Distribution of targets achieved:")
+        print(combined_results['TargetsAchieved'].value_counts().sort_index())
+        
+        # Calculate target achievement by trait
+        print("\nTarget achievement by trait (all batches):")
+        for trait in TARGET_VALUES.keys():
+            if f'{trait}_Achieved' in combined_results.columns:
+                achieved_count = combined_results[f'{trait}_Achieved'].sum()
+                total_count = len(combined_results)
+                print(f"  {trait}: {achieved_count}/{total_count} pairs ({achieved_count/total_count*100:.1f}%)")
+        
+        # Create visualization of target achievement
+        create_target_achievement_visualizations(combined_results, TARGET_VALUES, LOWER_IS_BETTER)
+            
+        return combined_results
+    else:
+        print("No pairs were selected across all batches")
+        return pd.DataFrame()
+
+
+def create_target_achievement_visualizations(results, target_values, lower_is_better):
+    """Create visualizations for target achievement"""
+    # Create a DataFrame to store trait averages and targets
+    trait_stats = []
+    
+    for trait, target in target_values.items():
+        if trait in results.columns and f'{trait}_Achieved' in results.columns:
+            avg_value = results[trait].mean()
+            achieved_count = results[f'{trait}_Achieved'].sum()
+            achieved_pct = achieved_count / len(results) * 100
+            
+            trait_stats.append({
+                'Trait': trait,
+                'Target': target,
+                'Average': avg_value,
+                'Achieved_Count': achieved_count,
+                'Achieved_Percent': achieved_pct,
+                'Direction': 'Lower is better' if trait in lower_is_better else 'Higher is better'
+            })
+    
+    trait_df = pd.DataFrame(trait_stats)
+    
+    # Save to CSV
+    trait_df.to_csv('trait_target_achievement.csv', index=False)
+    print("Trait target achievement data saved to 'trait_target_achievement.csv'")
+    
+    # Create a bar chart of target achievement percentages
+    plt.figure(figsize=(12, 6))
+    traits = trait_df['Trait'].tolist()
+    achievement_pcts = trait_df['Achieved_Percent'].tolist()
+    
+    # Sort by achievement percentage
+    sorted_indices = np.argsort(achievement_pcts)
+    sorted_traits = [traits[i] for i in sorted_indices]
+    sorted_pcts = [achievement_pcts[i] for i in sorted_indices]
+    
+    bars = plt.bar(sorted_traits, sorted_pcts)
+    
+    # Color bars based on achievement level
+    for i, bar in enumerate(bars):
+        if sorted_pcts[i] >= 80:
+            bar.set_color('green')
+        elif sorted_pcts[i] >= 50:
+            bar.set_color('orange')
+        else:
+            bar.set_color('red')
+    
+    plt.axhline(y=80, color='green', linestyle='--', alpha=0.5)
+    plt.axhline(y=50, color='orange', linestyle='--', alpha=0.5)
+    
+    plt.title('Target Achievement by Trait (%)')
+    plt.ylabel('Percentage of Pairs Meeting Target')
+    plt.xticks(rotation=45, ha='right')
+    plt.grid(axis='y', alpha=0.3)
+    plt.tight_layout()
+    plt.savefig('target_achievement_by_trait.png')
+    plt.close()
+    
+    # Create a histogram of total targets achieved per pair
+    plt.figure(figsize=(10, 6))
+    plt.hist(results['TargetsAchieved'], bins=range(0, len(target_values) + 1), alpha=0.7, color='blue', edgecolor='black')
+    plt.title('Distribution of Total Targets Achieved per Pair')
+    plt.xlabel('Number of Targets Achieved')
+    plt.ylabel('Number of Pairs')
+    plt.xticks(range(0, len(target_values) + 1))
+    plt.grid(axis='y', alpha=0.3)
+    plt.tight_layout()
+    plt.savefig('targets_achieved_distribution.png')
+    plt.close()
+    
+    # Create a comparative bar chart of average values vs targets
+    plt.figure(figsize=(15, 8))
+    traits = trait_df['Trait'].tolist()
+    x = np.arange(len(traits))
+    width = 0.35
+    
+    # Normalize targets and averages to be on similar scale for visualization
+    targets = trait_df['Target'].tolist()
+    averages = trait_df['Average'].tolist()
+    
+    # Create two separate plots for different directions
+    better_higher = trait_df['Direction'] != 'Lower is better'
+    better_lower = trait_df['Direction'] == 'Lower is better'
+    
+    plt.subplot(2, 1, 1)
+    higher_traits = trait_df[better_higher]['Trait'].tolist()
+    higher_targets = trait_df[better_higher]['Target'].tolist()
+    higher_avgs = trait_df[better_higher]['Average'].tolist()
+    higher_x = np.arange(len(higher_traits))
+    
+    plt.bar(higher_x - width/2, higher_targets, width, label='Target', color='blue', alpha=0.7)
+    plt.bar(higher_x + width/2, higher_avgs, width, label='Achieved Average', color='green', alpha=0.7)
+    plt.title('Traits Where Higher Values Are Better')
+    plt.xticks(higher_x, higher_traits, rotation=45, ha='right')
+    plt.legend()
+    plt.grid(axis='y', alpha=0.3)
+    
+    plt.subplot(2, 1, 2)
+    lower_traits = trait_df[better_lower]['Trait'].tolist()
+    lower_targets = trait_df[better_lower]['Target'].tolist()
+    lower_avgs = trait_df[better_lower]['Average'].tolist()
+    lower_x = np.arange(len(lower_traits))
+    
+    plt.bar(lower_x - width/2, lower_targets, width, label='Target', color='blue', alpha=0.7)
+    plt.bar(lower_x + width/2, lower_avgs, width, label='Achieved Average', color='red', alpha=0.7)
+    plt.title('Traits Where Lower Values Are Better')
+    plt.xticks(lower_x, lower_traits, rotation=45, ha='right')
+    plt.legend()
+    plt.grid(axis='y', alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig('trait_targets_vs_averages.png')
+    plt.close()
+
+
+# Modify the main function to use the batch optimization
+def main_with_batches(data_path, batch_size=23):
+    # Load data
+    data = load_data(data_path)
+    if data is None:
+        print("Failed to load data. Please check the file path and format.")
+        return
+    
+    print(f"Loaded {len(data)} potential breeding pairs")
+    
+    # Run optimization in batches
+    selected_pairs = optimize_breeding_in_batches(data, batch_size=batch_size)
+    
+    if len(selected_pairs) > 0:
+        # Analyze results
+        selected_pairs['Round'] = 1  # Mark all as first round for consistency with existing analysis
+        analyze_results(selected_pairs)
+        
+        # Save results
+        selected_pairs.to_csv('target_based_optimization_results.csv', index=False)
+        print("Results saved to 'target_based_optimization_results.csv'")
+    else:
+        print("Optimization failed to produce any valid pairs.")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python cattle_optimization.py <data_file_path> [batch_size]")
+        data_path = '2025cow.csv'  # Default file if not provided
+        print(f"No file specified, using default: {data_path}")
+    else:
+        data_path = sys.argv[1]
+        
+    # Optional batch size parameter
+    batch_size = 23
+    if len(sys.argv) >= 3:
+        try:
+            batch_size = int(sys.argv[2])
+            print(f"Using batch size: {batch_size}")
+        except ValueError:
+            print(f"Invalid batch size provided, using default: {batch_size}")
+
+```
+
+```{python}
+    main('2025cow.csv')
+
+```
+
+```{python}
+main_with_batches('2025cow.csv', 23)
+
+```

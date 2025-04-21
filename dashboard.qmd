@@ -810,3 +810,314 @@ def run_optimization(_epds_with_target):
         return None
 
 ```
+
+
+```{python}
+@st.cache_data
+def run_optimization(_epds_with_target, target_values=None):
+    """
+    Optimize breeding pairs based on target values for various traits.
+    ENSURES ALL COWS GET PAIRED with no exclusions.
+    
+    Parameters:
+    _epds_with_target - DataFrame with cow/bull pairs and their traits
+    target_values - Dictionary with target values for each trait
+    """
+    try:
+        # Default target values if not provided
+        if target_values is None:
+            target_values = {
+                'CED': 14, 'BW': -3, 'WW': 65, 'YW': 100, 'ADG': 0.28,
+                'DMI': 0.6, 'Milk': 29, 'ME': -2, 'HPG': 12, 'CEM': 8,
+                'STAY': 18, 'Marb': 0.5, 'YG': 0.03, 'CW': 29, 'REA': 0.17,
+                'FAT': 0, 'HB': 70, 'GM': 46
+            }
+        
+        # Define metrics where lower values are better
+        lower_is_better = ['DMI', 'BW', 'ME', 'YG', 'FAT']
+        
+        # Get unique cows and bulls
+        cows = _epds_with_target['cow'].unique().to_list()
+        bulls = _epds_with_target['bull'].unique().to_list()
+        
+        # Calculate the original bull limit
+        original_bull_limit = max(1, len(cows) // 5)
+        
+        # Calculate minimum required bull limit to ensure all cows get paired
+        required_bull_limit = (len(cows) + len(bulls) - 1) // len(bulls)
+        
+        # Use the higher of the two to ensure all cows get paired
+        bull_limit = max(original_bull_limit, required_bull_limit)
+        
+        # Identify all metrics to use in optimization
+        all_metrics = ['CED', 'BW', 'WW', 'YW', 'ADG', 'DMI', 'Milk', 'ME', 'HPG', 
+                      'CEM', 'STAY', 'Marb', 'YG', 'CW', 'REA', 'FAT', 'HB', 'GM']
+        
+        # Filter to only metrics present in the data
+        available_metrics = [m for m in all_metrics if m in _epds_with_target.columns]
+        
+        # Calculate standard deviations for normalization
+        std_values = {}
+        for metric in available_metrics:
+            std_values[metric] = max(_epds_with_target.select(pl.std(metric)).item(), 0.0001)
+        
+        # Calculate a score for each pairing based on closeness to target values
+        pairing_scores = []
+        
+        for i in range(len(_epds_with_target)):
+            row = _epds_with_target.row(i)
+            cow = row[_epds_with_target.columns.index('cow')]
+            bull = row[_epds_with_target.columns.index('bull')]
+            
+            # Calculate standardized distance from target for each metric
+            metric_scores = {}
+            total_score = 0
+            better_than_target_count = 0
+            
+            for metric in available_metrics:
+                if metric in _epds_with_target.columns:
+                    metric_idx = _epds_with_target.columns.index(metric)
+                    metric_value = row[metric_idx]
+                    target = target_values.get(metric, 0)
+                    
+                    # Calculate z-score differently based on whether lower or higher is better
+                    if metric in lower_is_better:
+                        # For metrics where lower is better, a negative z-score is good
+                        z_score = (target - metric_value) / std_values[metric]
+                        is_better = metric_value <= target
+                    else:
+                        # For metrics where higher is better, a positive z-score is good
+                        z_score = (metric_value - target) / std_values[metric]
+                        is_better = metric_value >= target
+                    
+                    # Only count positive contributions (better than target)
+                    if is_better:
+                        better_than_target_count += 1
+                        total_score += max(0, z_score)  # Only use positive score
+                    
+                    metric_scores[metric] = {
+                        'value': metric_value,
+                        'target': target,
+                        'z_score': z_score,
+                        'is_better': is_better
+                    }
+            
+            # Store all the information for this pairing
+            pairing_scores.append({
+                'index': i,
+                'cow': cow,
+                'bull': bull,
+                'better_than_target_count': better_than_target_count,
+                'total_score': total_score,
+                'metrics': metric_scores
+            })
+        
+        # Function to solve the optimization
+        def solve_optimization(excluded_pairings=None):
+            from pulp import LpProblem, LpMaximize, LpVariable, LpBinary, lpSum
+            
+            # Initialize the optimization problem
+            prob = LpProblem("Breeding_Optimization", LpMaximize)
+            
+            # Create decision variables
+            n = len(_epds_with_target)
+            vars = {
+                i: LpVariable(f"x_{i}", cat=LpBinary)
+                for i in range(n)
+            }
+            
+            # Objective function: Maximize the combined score
+            prob += lpSum(
+                vars[i] * (3 * pairing_scores[i]['better_than_target_count'] + pairing_scores[i]['total_score'])
+                for i in range(n)
+            )
+            
+            # CRITICAL CONSTRAINT: Each cow breeds EXACTLY once - this ensures ALL cows get paired
+            for cow in cows:
+                prob += lpSum(
+                    vars[i]
+                    for i in range(n)
+                    if pairing_scores[i]['cow'] == cow
+                ) == 1  # EXACTLY one pairing per cow
+            
+            # Constraint: Each bull can breed with at most bull_limit cows
+            for bull in bulls:
+                prob += lpSum(
+                    vars[i]
+                    for i in range(n)
+                    if pairing_scores[i]['bull'] == bull
+                ) <= bull_limit
+            
+            # Add exclusion constraints if any
+            if excluded_pairings:
+                # Force at least one pairing to be different
+                prob += lpSum(
+                    vars[i] for i in excluded_pairings
+                ) <= len(excluded_pairings) - 1
+            
+            # Solve the problem
+            status = prob.solve()
+            
+            # If the problem couldn't be solved with the exact constraint,
+            # we need to relax the bull limit
+            if status != 1:
+                # Calculate a higher bull limit that will definitely work
+                new_bull_limit = (len(cows) + len(bulls) - 1) // len(bulls)
+                st.warning(f"Could not find a solution with bull limit {bull_limit}. " 
+                           f"Increasing to {new_bull_limit} to ensure all cows get paired.")
+                
+                # Update the constraint
+                for bull in bulls:
+                    prob.constraints[f"Bull_{bull}"].changeRHS(new_bull_limit)
+                
+                # Try solving again
+                status = prob.solve()
+                
+                # If still failing, create a last-resort solution by assigning cows
+                # to bulls without optimization
+                if status != 1:
+                    st.error("Could not solve optimization problem. Using fallback method.")
+                    # Create a simple assignment (each cow to its best bull)
+                    result = []
+                    selected_indices = []
+                    
+                    # Group by cow and find best bull for each
+                    cow_bull_scores = {}
+                    for i in range(n):
+                        cow = pairing_scores[i]['cow']
+                        score = pairing_scores[i]['better_than_target_count'] + pairing_scores[i]['total_score']
+                        
+                        if cow not in cow_bull_scores or score > cow_bull_scores[cow]['score']:
+                            cow_bull_scores[cow] = {
+                                'index': i,
+                                'score': score
+                            }
+                    
+                    # Create result from best bull for each cow
+                    for cow, data in cow_bull_scores.items():
+                        i = data['index']
+                        selected_pair = {
+                            "cow": pairing_scores[i]['cow'],
+                            "bull": pairing_scores[i]['bull'],
+                            "better_than_target_count": pairing_scores[i]['better_than_target_count'],
+                            "total_score": round(pairing_scores[i]['total_score'], 2)
+                        }
+                        
+                        # Include individual metric values
+                        for metric in available_metrics:
+                            if metric in pairing_scores[i]['metrics']:
+                                selected_pair[metric] = pairing_scores[i]['metrics'][metric]['value']
+                        
+                        result.append(selected_pair)
+                        selected_indices.append(i)
+                    
+                    return result, selected_indices
+            
+            # Extract the results
+            result = []
+            selected_indices = []
+            for i in range(n):
+                if vars[i].value() == 1:  # If this pairing is selected
+                    selected_pair = {
+                        "cow": pairing_scores[i]['cow'],
+                        "bull": pairing_scores[i]['bull'],
+                        "better_than_target_count": pairing_scores[i]['better_than_target_count'],
+                        "total_score": round(pairing_scores[i]['total_score'], 2)
+                    }
+                    
+                    # Include individual metric values in the result
+                    for metric in available_metrics:
+                        if metric in pairing_scores[i]['metrics']:
+                            selected_pair[metric] = pairing_scores[i]['metrics'][metric]['value']
+                    
+                    result.append(selected_pair)
+                    selected_indices.append(i)
+            
+            # Verify that all cows are paired
+            paired_cows = set(item["cow"] for item in result)
+            if len(paired_cows) < len(cows):
+                st.warning(f"Only {len(paired_cows)} cows out of {len(cows)} were paired. " 
+                           "Using fallback method to ensure all cows get paired.")
+                
+                # Add the remaining cows with their best available bull
+                for cow in cows:
+                    if cow not in paired_cows:
+                        # Find the best score for this cow
+                        best_score = -float('inf')
+                        best_idx = -1
+                        
+                        for i in range(n):
+                            if pairing_scores[i]['cow'] == cow and i not in selected_indices:
+                                score = pairing_scores[i]['better_than_target_count'] + pairing_scores[i]['total_score']
+                                if score > best_score:
+                                    best_score = score
+                                    best_idx = i
+                        
+                        if best_idx >= 0:
+                            i = best_idx
+                            selected_pair = {
+                                "cow": pairing_scores[i]['cow'],
+                                "bull": pairing_scores[i]['bull'],
+                                "better_than_target_count": pairing_scores[i]['better_than_target_count'],
+                                "total_score": round(pairing_scores[i]['total_score'], 2)
+                            }
+                            
+                            # Include individual metric values
+                            for metric in available_metrics:
+                                if metric in pairing_scores[i]['metrics']:
+                                    selected_pair[metric] = pairing_scores[i]['metrics'][metric]['value']
+                            
+                            result.append(selected_pair)
+                            selected_indices.append(i)
+            
+            return result, selected_indices
+        
+        # Generate the initial solution
+        primary_solution, primary_indices = solve_optimization()
+        
+        # Generate a secondary solution by excluding the primary solution
+        secondary_solution, secondary_indices = solve_optimization(primary_indices)
+        
+        # Convert solutions to DataFrames
+        primary_pairings = pl.DataFrame(primary_solution)
+        
+        # Count bulls in primary solution
+        primary_bull_counts = primary_pairings.group_by("bull").agg(
+            pl.count().alias("count")
+        ).sort("count", descending=True)
+        
+        # Do the same for secondary solution
+        if secondary_solution:
+            secondary_pairings = pl.DataFrame(secondary_solution)
+            secondary_bull_counts = secondary_pairings.group_by("bull").agg(
+                pl.count().alias("count")
+            ).sort("count", descending=True)
+        else:
+            secondary_pairings = None
+            secondary_bull_counts = None
+        
+        # Verify that all cows are paired in the primary solution
+        paired_cows = set(primary_pairings['cow'].to_list())
+        if len(paired_cows) != len(cows):
+            st.error(f"ERROR: Only {len(paired_cows)} cows out of {len(cows)} were paired! Please contact support.")
+        
+        return {
+            "primary_pairings": primary_pairings,
+            "primary_bull_counts": primary_bull_counts,
+            "secondary_pairings": secondary_pairings,
+            "secondary_bull_counts": secondary_bull_counts,
+            "selected_indices": primary_indices,
+            "pairing_scores": pairing_scores,
+            "available_metrics": available_metrics,
+            "target_values": target_values,
+            "total_cows": len(cows),
+            "total_bulls": len(bulls),
+            "bull_limit": bull_limit
+        }
+        
+    except Exception as e:
+        import traceback
+        st.error(f"Optimization error: {e}")
+        st.error(traceback.format_exc())
+        return None
+```

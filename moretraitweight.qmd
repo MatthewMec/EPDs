@@ -1,0 +1,324 @@
+```{python}
+#highest number of categories that are higher than 30%, followed by if an important category, CED, ME, then secondary traits, MILK, MARB, then tertiary traits all others
+
+from ortools.sat.python import cp_model
+import polars as pl
+
+def create_epd_model_from_offspring(offspring_epds: pl.DataFrame, trait_threshold: float = 0.3):
+    model = cp_model.CpModel()
+
+    # Identify EPD traits
+    ignore_columns = {"AnimalID", "RAAA#", "Sex", "Name", "DOB", "BrdCds"}
+    epd_traits = [col for col in offspring_epds.columns if col not in ignore_columns]
+
+    # Normalize traits to 0-1 scale
+    for trait in epd_traits:
+        min_val = offspring_epds.select(trait).min()[0, 0]
+        max_val = offspring_epds.select(trait).max()[0, 0]
+        offspring_epds = offspring_epds.with_columns(
+            ((pl.col(trait) - min_val) / (max_val - min_val)).alias(f"{trait}_scaled")
+        )
+
+    # Split AnimalID into CowID and BullID
+    df = offspring_epds.with_columns(
+        pl.col("AnimalID").str.split("-").alias("AnimalID_split")
+    ).with_columns(
+        pl.col("AnimalID_split").list.get(0).alias("CowID"),
+        pl.col("AnimalID_split").list.get(1).alias("BullID"),
+    ).drop("AnimalID_split")
+
+    # Build EPD dictionary
+    offspring_epds_dict = {}
+    for row in df.to_dicts():
+        cow_id = row['CowID']
+        bull_id = row['BullID']
+        pair_id = f'{cow_id}-{bull_id}'
+        if row.get("CED", 0) < 14 or row.   get("ME", 999) > 0:
+            continue  # Skip invalid pair
+        epd_values = {k: v for k, v in row.items() if k.endswith('_scaled')}
+        offspring_epds_dict[pair_id] = epd_values
+
+    # Cow and Bull ID lists
+    cow_ids = df.select(pl.col("CowID").unique()).to_series().to_list()
+    bull_ids = df.select(pl.col("BullID").unique()).to_series().to_list()
+    num_cows = len(cow_ids)
+    num_bulls = len(bull_ids)
+    max_bull_capacity = int(0.20 * num_cows)
+
+    pairing_vars = [model.NewIntVar(0, num_bulls - 1, f'cow_{i}') for i in range(num_cows)]
+
+    # Constraint: Limit number of cows per bull
+    for j in range(num_bulls):
+        uses = [model.NewBoolVar(f"cow_{i}_uses_bull_{j}") for i in range(num_cows)]
+        for i in range(num_cows):
+            model.Add(pairing_vars[i] == j).OnlyEnforceIf(uses[i])
+            model.Add(pairing_vars[i] != j).OnlyEnforceIf(uses[i].Not())
+        model.Add(sum(uses) <= max_bull_capacity)
+
+    # Trait categories
+    important_traits = {"CED", "ME"}
+    secondary_traits = {"Milk", "Marb"}
+
+    scaled_epd_traits = [f"{trait}_scaled" for trait in epd_traits]
+    trait_priority = {}
+    for trait in epd_traits:
+        if trait in important_traits:
+            trait_priority[f"{trait}_scaled"] = 3
+        elif trait in secondary_traits:
+            trait_priority[f"{trait}_scaled"] = 2
+        else:
+            trait_priority[f"{trait}_scaled"] = 1
+
+    total_score = model.NewIntVar(0, num_cows * len(epd_traits) * 3, "total_score")
+    all_scores = []
+
+    for i, cow_id in enumerate(cow_ids):
+        for j, bull_id in enumerate(bull_ids):
+            pair_key = f'{cow_id}-{bull_id}'
+            bool_var = model.NewBoolVar(f"cow_{i}_bull_{j}_selected")
+            model.Add(pairing_vars[i] == j).OnlyEnforceIf(bool_var)
+            model.Add(pairing_vars[i] != j).OnlyEnforceIf(bool_var.Not())
+
+            for trait in scaled_epd_traits:
+                epd_val = offspring_epds_dict.get(pair_key, {}).get(trait, 0)
+                meets_threshold = model.NewBoolVar(f"{trait}_{i}_{j}_meets")
+                model.AddBoolOr([
+                    model.NewBoolVarFromExpression(epd_val >= trait_threshold).Not(),
+                    bool_var.Not(),
+                    meets_threshold
+                ])
+                trait_score = model.NewIntVar(0, trait_priority[trait], f"score_{trait}_{i}_{j}")
+                model.Add(trait_score == trait_priority[trait]).OnlyEnforceIf(meets_threshold)
+                model.Add(trait_score == 0).OnlyEnforceIf(meets_threshold.Not())
+                all_scores.append(trait_score)
+
+    model.Add(total_score == sum(all_scores))
+    model.Maximize(total_score)
+
+    return model, pairing_vars, cow_ids, bull_ids
+```
+
+```{python}
+from ortools.sat.python import cp_model
+import polars as pl
+
+def create_epd_model_from_offspring(offspring_epds: pl.DataFrame, target_values: dict):
+    model = cp_model.CpModel()
+
+    # Identify EPD traits
+    ignore_columns = {"AnimalID", "RAAA#", "Sex", "Name", "DOB", "BrdCds"}
+    epd_traits = [col for col in offspring_epds.columns if col not in ignore_columns]
+
+    # Normalize traits to 0-1 scale
+    for trait in epd_traits:
+        min_val = offspring_epds.select(trait).min()[0, 0]
+        max_val = offspring_epds.select(trait).max()[0, 0]
+        offspring_epds = offspring_epds.with_columns(
+            ((pl.col(trait) - min_val) / (max_val - min_val)).alias(f"{trait}_scaled")
+        )
+
+    # Split AnimalID into CowID and BullID
+    df = offspring_epds.with_columns(
+        pl.col("AnimalID").str.split("-").alias("AnimalID_split")
+    ).with_columns(
+        pl.col("AnimalID_split").list.get(0).alias("CowID"),
+        pl.col("AnimalID_split").list.get(1).alias("BullID"),
+    ).drop("AnimalID_split")
+
+    # Filter out invalid pairings based on hard constraints
+    offspring_epds_dict = {}
+    for row in df.to_dicts():
+        cow_id = row['CowID']
+        bull_id = row['BullID']
+        pair_id = f'{cow_id}-{bull_id}'
+
+        if row.get("CED", 0) < 14 or row.get("ME", 999) > 0:
+            continue
+
+        epd_values = {k: v for k, v in row.items() if k.endswith('_scaled')}
+        trait_values = {k: v for k, v in row.items() if k in target_values}
+        offspring_epds_dict[pair_id] = {**epd_values, **trait_values}
+
+    # Cow and Bull ID lists
+    cow_ids = list(set([k.split('-')[0] for k in offspring_epds_dict.keys()]))
+    bull_ids = list(set([k.split('-')[1] for k in offspring_epds_dict.keys()]))
+    num_cows = len(cow_ids)
+    num_bulls = len(bull_ids)
+    max_bull_capacity = int(0.20 * num_cows)
+
+    cow_index_map = {cow_id: i for i, cow_id in enumerate(cow_ids)}
+    bull_index_map = {bull_id: i for i, bull_id in enumerate(bull_ids)}
+
+    pairing_vars = [model.NewIntVar(0, num_bulls - 1, f'cow_{cow_id}') for cow_id in cow_ids]
+
+    # Constraint: Limit number of cows per bull
+    for j, bull_id in enumerate(bull_ids):
+        uses = [model.NewBoolVar(f"cow_{i}_uses_bull_{j}") for i in range(num_cows)]
+        for i in range(num_cows):
+            model.Add(pairing_vars[i] == j).OnlyEnforceIf(uses[i])
+            model.Add(pairing_vars[i] != j).OnlyEnforceIf(uses[i].Not())
+        model.Add(sum(uses) <= max_bull_capacity)
+
+    # Rank-based trait categorization
+    primary_traits = {"CED", "ME"}
+    secondary_traits = {"Milk", "Marb"}
+    tertiary_traits = set(target_values.keys()) - primary_traits - secondary_traits
+
+    # Objective: maximize traits meeting or exceeding target values
+    trait_importance = {
+        'CED': 2, 'ME': 2,                # Primary traits
+        'Milk': 1.2, 'Marb': 1.2,             # Secondary traits
+        # All others get default score of 1
+    }
+
+    total_score_terms = []
+
+    for i, cow_id in enumerate(cow_ids):
+        pair_score_expr = []
+
+        for j, bull_id in enumerate(bull_ids):
+            pair_key = f'{cow_id}-{bull_id}'
+            if pair_key not in offspring_epds_dict:
+                continue
+
+            epd_values = offspring_epds_dict[pair_key]
+            trait_score = 0
+
+            for trait, target in target_values.items():
+                trait_val = epd_values.get(trait)
+                if trait_val is not None and trait_val >= target:
+                    trait_score += trait_importance.get(trait, 1)
+
+            # Condition: score is only counted if cow i is paired with bull j
+            pair_score_expr.append(trait_score * model.NewBoolVar(f"select_{i}_{j}"))
+            select_var = pair_score_expr[-1]
+            model.Add(pairing_vars[i] == j).OnlyEnforceIf(select_var)
+            model.Add(pairing_vars[i] != j).OnlyEnforceIf(select_var.Not())
+
+        total_score_terms.extend(pair_score_expr)
+
+    model.Maximize(sum(total_score_terms))
+    return model, pairing_vars, cow_ids, bull_ids
+
+
+```
+
+```{python}
+from ortools.sat.python import cp_model
+import polars as pl
+
+def create_epd_model_from_offspring(offspring_epds: pl.DataFrame, target_values: dict):
+    model = cp_model.CpModel()
+
+    # Identify EPD traits
+    ignore_columns = {"AnimalID", "RAAA#", "Sex", "Name", "DOB", "BrdCds", "CowID", "BullID"}
+    epd_traits = [col for col in offspring_epds.columns if col not in ignore_columns]
+
+    # Normalize traits to 0-1 scale
+    for trait in epd_traits:
+        min_val = offspring_epds.select(trait).min()[0, 0]
+        max_val = offspring_epds.select(trait).max()[0, 0]
+        offspring_epds = offspring_epds.with_columns(
+            ((pl.col(trait) - min_val) / (max_val - min_val)).alias(f"{trait}_scaled")
+        )
+
+    # Split AnimalID into CowID and BullID
+    df = offspring_epds.with_columns(
+        pl.col("AnimalID").str.split("-").alias("AnimalID_split")
+    ).with_columns(
+        pl.col("AnimalID_split").list.get(0).alias("CowID"),
+        pl.col("AnimalID_split").list.get(1).alias("BullID"),
+    ).drop("AnimalID_split")
+
+    # Calculate TraitsAboveTarget
+    df = df.with_columns([
+        pl.sum([
+            (pl.col(trait) >= target_values[trait]).cast(pl.Int8)
+            for trait in target_values.keys()
+        ]).alias("TraitsAboveTarget")
+    ])
+
+    # Build EPD dictionary
+    offspring_epds_dict = {}
+    for row in df.to_dicts():
+        cow_id = row['CowID']
+        bull_id = row['BullID']
+        pair_id = f'{cow_id}-{bull_id}'
+
+        # Hard constraint
+        if row.get("CED", 0) < 14 or row.get("ME", 1) > 0:
+            continue
+
+        epd_values = {k: row.get(k) for k in target_values.keys()}
+        epd_values["TraitsAboveTarget"] = row["TraitsAboveTarget"]
+        offspring_epds_dict[pair_id] = epd_values
+
+    # Cow and Bull ID lists
+    cow_ids = df.select(pl.col("CowID").unique()).to_series().to_list()
+    bull_ids = df.select(pl.col("BullID").unique()).to_series().to_list()
+    num_cows = len(cow_ids)
+    num_bulls = len(bull_ids)
+    max_bull_capacity = int(0.20 * num_cows)
+
+    pairing_vars = [model.NewIntVar(0, num_bulls - 1, f'cow_{cow_id}') for cow_id in cow_ids]
+
+    # Constraint: Limit number of cows per bull
+    for j, bull_id in enumerate(bull_ids):
+        uses = [model.NewBoolVar(f"cow_{i}_uses_bull_{j}") for i in range(num_cows)]
+        for i in range(num_cows):
+            model.Add(pairing_vars[i] == j).OnlyEnforceIf(uses[i])
+            model.Add(pairing_vars[i] != j).OnlyEnforceIf(uses[i].Not())
+        model.Add(sum(uses) <= max_bull_capacity)
+
+    # Objective: Maximize number of traits above target
+    score_vars = []
+    for i, cow_id in enumerate(cow_ids):
+        score_expr = []
+        for j, bull_id in enumerate(bull_ids):
+            pair_key = f'{cow_id}-{bull_id}'
+            score = offspring_epds_dict.get(pair_key, {}).get("TraitsAboveTarget", 0)
+            score_expr.append(score * (pairing_vars[i] == j))
+        score_vars.append(sum(score_expr))
+
+    model.Maximize(sum(score_vars))
+    return model, pairing_vars, cow_ids, bull_ids
+
+
+```
+
+```{python}
+def get_pairings_with_epds(model, solver, pairing_vars, cow_ids, bull_ids, offspring_epds: pl.DataFrame) -> pl.DataFrame:
+    # Step 1: Build Pairings DataFrame
+    pairings = []
+    for i, cow_id in enumerate(cow_ids):
+        bull_index = solver.Value(pairing_vars[i])
+        bull_id = bull_ids[bull_index]
+        pairings.append((cow_id, bull_id, f"{cow_id}-{bull_id}"))
+    
+    pairings_df = pl.DataFrame(pairings, schema=["CowID", "BullID", "PairID"])
+
+    # Step 2: Create PairID in the original EPDs DataFrame
+    epds_with_pairid = offspring_epds.with_columns(
+        (pl.col("AnimalID")).alias("PairID")
+    )
+
+    # Step 3: Join on PairID
+    joined = pairings_df.join(epds_with_pairid, on="PairID", how="left")
+
+    return joined
+solver = cp_model.CpSolver()
+status = solver.Solve(model)
+
+if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
+    full_pairings_df = get_pairings_with_epds(model, solver, pairing_vars, cow_ids, bull_ids, offspring_epds)
+    print(full_pairings_df)
+    full_pairings_df.write_csv("pairings_with_epds.csv")
+else:
+    print("No feasible solution found.")
+```
+
+```{python}
+full_pairings_df.write_csv('traitbasedpairingswithcolumn.csv', separator=',')
+```
+
+

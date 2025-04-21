@@ -1,0 +1,136 @@
+OPTIMAL BREEDING ASSIGNMENTS
+================================================================================
+
+SUMMARY:
+Total cows: 117
+Total bulls used: 6
+Average traits meeting target per pairing: 11.13
+
+BULL ASSIGNMENTS:
+Bull Z124G: 20 cows
+Bull 1278J: 23 cows
+Bull D172: 23 cows
+Bull 9191G: 23 cows
+Bull 1181J: 18 cows
+Bull 8269: 10 cows
+
+DETAILED PAIRINGS:
+Cow        Bull       Score Traits Meeting Target                             
+--------------------------------------------------------------------------------
+D10        Z124G      13    PROS, CED, BW, DMI, ME, CEM, STAY, Marb, YG, REA, 
+F79        1278J      13    PROS, CED, BW, DMI, ME, CEM, STAY, Marb, YG, REA, 
+G22        1278J      13    PROS, CED, BW, DMI, Milk, ME, CEM, STAY, YG, REA, 
+G65        1278J      13    PROS, CED, BW, DMI, Milk, ME, CEM, STAY, YG, REA, 
+H37        1278J      13    PROS, CED, BW, DMI, ME, CEM, STAY, Marb, YG, REA, 
+H11        Z124G      13    PROS, CED, BW, DMI, ME, CEM, STAY, Marb, YG, REA, 
+J27        1278J      13    PROS, CED, BW, DMI, Milk, ME, CEM, STAY, Marb, YG,
+J05        D172       13    PROS, CED, WW, YW, ADG, HPG, CEM, STAY, Marb, YG, 
+K67        1278J      13    PROS, CED, DMI, Milk, ME, CEM, STAY, Marb, YG, REA
+K72        1278J      13    PROS, CED, BW, DMI, ME, CEM, STAY, Marb, YG, REA, 
+K05        1278J      13    PROS, CED, WW, YW, ME, CEM, STAY, Marb, YG, REA, F
+K56        1278J      13    PROS, CED, DMI, Milk, ME, CEM, STAY, Marb, YG, REA
+L63        9191G      13    PROS, CED, BW, WW, YW, Milk, HPG, CEM, Marb, YG, R
+L66        1278J      13    PROS, CED, BW, DMI, Milk, ME, CEM, STAY, Marb, YG,
+L35        9191G      12    PROS, CED, BW, DMI, Milk, ME, HPG, CEM, STAY, Marb
+N46        9191G      12    PROS, CED, BW, DMI, Milk, ME, HPG, CEM, STAY, Marb
+F81        1181J      12    PROS, CED, BW, DMI, Milk, CEM, STAY, Marb, CW, FAT
+G11        1278J      12    PROS, CED, BW, DMI, Milk, ME, CEM, Marb, YG, FAT, 
+G25        1181J      12    PROS, CED, BW, YW, DMI, CEM, STAY, Marb, CW, FAT, 
+G29        1278J      12    PROS, CED, BW, DMI, ME, CEM, Marb, YG, REA, FAT, H
+G34        Z124G      12    PROS, CED, BW, DMI, ME, STAY, Marb, YG, REA, FAT, 
+G60        Z124G      12    PROS, CED, BW, DMI, CEM, STAY, Marb, YG, REA, FAT,
+G09        1278J      12    PROS, CED, BW, DMI, ME, CEM, Marb, YG, REA, FAT, H
+H62        1278J      12    PROS, CED, DMI, ME, CEM, STAY, Marb, YG, REA, FAT,
+H61        Z124G      12    PROS, CED, BW, DMI, CEM, STAY, Marb, YG, REA, FAT,
+H44        Z124G      12    PROS, CED, BW, DMI, CEM, STAY, Marb, YG, REA, FAT,
+J33        9191G      12    PROS, CED, BW, DMI, Milk, ME, HPG, CEM, STAY, Marb
+J03        1278J      12    PROS, CED, BW, DMI, Milk, ME, CEM, Marb, YG, FAT, 
+J51        1181J      12    PROS, CED, BW, YW, HPG, CEM, STAY, Marb, CW, FAT, 
+J40        D172       12    PROS, DMI, ME, HPG, CEM, STAY, Marb, YG, REA, FAT,
+J65        1181J      12    PROS, CED, WW, YW, Milk, STAY, Marb, YG, CW, REA, 
+J61        1278J      12    PROS, CED, BW, DMI, Milk, ME, CEM, Marb, YG, REA, 
+J04        D172       12    PROS, CED, BW, DMI, ME, HPG, CEM, STAY, Marb, YG, 
+J46        D172       12    PROS, CED, BW, YW, HPG, CEM, Marb, YG, REA, FAT, H
+J41        1278J      12    PROS, CED, BW, DMI, Milk, ME, CEM, Marb, YG, REA, 
+K30        1278J      12    PROS, CED, DMI, ME, CEM, STAY, Marb, YG, REA, FAT,
+K11        D172       12    PROS, CED, BW, YW, ME, HPG, CEM, Marb, YG, FAT, HB
+L06        D172       12    PROS, CED, BW, YW, ME, HPG, CEM, Marb, YG, FAT, HB
+L28        8269       12    PROS, CED, BW, DMI, ME, CEM, STAY, Marb, YG, REA, 
+L29        D172       12    PROS, CED, BW, ME, HPG, CEM, Marb, YG, REA, FAT, H
+L44        8269       12    PROS, CED, BW, DMI, Milk, ME, CEM, STAY, Marb, YG,
+L58        D172       12    PROS, CED, BW, YW, HPG, CEM, STAY, Marb, YG, REA, 
+L60        9191G      12    PROS, CED, BW, DMI, Milk, HPG, CEM, Marb, YG, REA,
+L64        D172       12    PROS, CED, BW, YW, HPG, CEM, STAY, Marb, YG, REA, 
+L88        D172       12    PROS, CED, BW, YW, ME, HPG, CEM, Marb, YG, FAT, HB
+K06        9191G      11    PROS, CED, BW, DMI, ME, HPG, CEM, STAY, Marb, HB, 
+L10        9191G      11    PROS, CED, BW, DMI, ME, HPG, CEM, STAY, Marb, HB, 
+C16        9191G      11    PROS, CED, BW, DMI, ME, HPG, CEM, STAY, Marb, HB, 
+C19        Z124G      11    PROS, CED, DMI, Milk, STAY, Marb, YG, REA, FAT, HB
+C66        9191G      11    PROS, CED, BW, DMI, ME, HPG, CEM, STAY, Marb, HB, 
+C12        9191G      11    PROS, CED, BW, DMI, Milk, HPG, CEM, STAY, Marb, HB
+C14        9191G      11    PROS, CED, BW, DMI, ME, HPG, CEM, STAY, Marb, HB, 
+C28        Z124G      11    PROS, CED, DMI, Milk, STAY, Marb, YG, REA, FAT, HB
+C17        9191G      11    PROS, CED, BW, DMI, ME, HPG, CEM, STAY, Marb, HB, 
+D23        9191G      11    PROS, CED, BW, DMI, ME, HPG, CEM, STAY, Marb, HB, 
+E30        9191G      11    PROS, CED, BW, DMI, ME, HPG, CEM, STAY, Marb, HB, 
+E59        9191G      11    PROS, CED, BW, DMI, ME, HPG, CEM, STAY, Marb, HB, 
+F08        1181J      11    PROS, WW, YW, ADG, HPG, STAY, Marb, CW, FAT, HB, G
+F19        D172       11    PROS, CED, BW, DMI, ME, HPG, CEM, STAY, YG, HB, GM
+F21        9191G      11    PROS, CED, BW, DMI, ME, HPG, CEM, STAY, Marb, HB, 
+G10        D172       11    PROS, CED, BW, DMI, ME, HPG, CEM, STAY, YG, HB, GM
+G35        Z124G      11    PROS, CED, DMI, Milk, STAY, Marb, YG, REA, FAT, HB
+H50        9191G      11    PROS, CED, BW, DMI, Milk, HPG, CEM, STAY, Marb, HB
+H26        Z124G      11    PROS, CED, BW, DMI, STAY, Marb, YG, REA, FAT, HB, 
+H42        1181J      11    PROS, CED, BW, WW, YW, STAY, Marb, CW, FAT, HB, GM
+J76        1278J      11    PROS, CED, BW, DMI, Milk, ME, CEM, Marb, YG, FAT, 
+J45        9191G      11    PROS, CED, BW, Milk, HPG, CEM, Marb, YG, REA, HB, 
+J80        D172       11    PROS, CED, BW, ME, HPG, CEM, STAY, Marb, YG, HB, G
+K32        1278J      11    PROS, CED, BW, DMI, Milk, ME, CEM, Marb, YG, FAT, 
+K82        1181J      11    PROS, CED, BW, WW, YW, STAY, Marb, CW, FAT, HB, GM
+K69        D172       11    PROS, CED, WW, YW, HPG, CEM, STAY, YG, REA, HB, GM
+K68        1181J      11    PROS, CED, BW, YW, Milk, CEM, STAY, Marb, FAT, HB,
+K65        1278J      11    CED, BW, DMI, Milk, ME, CEM, Marb, YG, REA, FAT, G
+K03B       D172       11    PROS, CED, BW, ME, HPG, CEM, Marb, YG, FAT, HB, GM
+L09        D172       11    PROS, CED, BW, ME, HPG, CEM, Marb, YG, FAT, HB, GM
+L12        8269       11    CED, BW, DMI, Milk, ME, CEM, Marb, YG, REA, HB, GM
+L20        D172       11    PROS, WW, YW, ME, HPG, CEM, Marb, YG, REA, HB, GM
+L22        D172       11    PROS, CED, YW, ME, HPG, CEM, Marb, YG, FAT, HB, GM
+L33        1181J      11    PROS, WW, YW, ADG, CEM, STAY, Marb, CW, FAT, HB, G
+L49        1278J      11    PROS, CED, YW, Milk, ME, CEM, Marb, YG, REA, FAT, 
+L61        9191G      11    PROS, CED, BW, DMI, Milk, ME, HPG, CEM, Marb, HB, 
+L70        1181J      11    PROS, WW, YW, Milk, STAY, Marb, YG, CW, REA, FAT, 
+L73        1278J      11    CED, BW, DMI, Milk, ME, CEM, Marb, YG, REA, FAT, G
+L94        1181J      11    PROS, CED, WW, YW, Milk, STAY, Marb, CW, FAT, HB, 
+N56        Z124G      10    PROS, DMI, Milk, STAY, Marb, YG, REA, FAT, HB, GM
+A60        Z124G      10    PROS, DMI, Milk, STAY, Marb, YG, REA, FAT, HB, GM
+C47        Z124G      10    PROS, DMI, Milk, STAY, Marb, YG, REA, FAT, HB, GM
+C32        8269       10    PROS, CED, DMI, Milk, ME, CEM, STAY, YG, FAT, HB
+D19        Z124G      10    PROS, CED, BW, DMI, CEM, Marb, YG, REA, FAT, GM
+E29        8269       10    PROS, CED, DMI, Milk, ME, CEM, STAY, YG, FAT, HB
+F06        Z124G      10    PROS, DMI, Milk, STAY, Marb, YG, REA, FAT, HB, GM
+F83        8269       10    CED, BW, DMI, Milk, ME, CEM, STAY, YG, FAT, HB
+G07        Z124G      10    PROS, CED, DMI, ME, STAY, Marb, YG, REA, FAT, GM
+H86        Z124G      10    PROS, CED, DMI, STAY, Marb, YG, REA, FAT, HB, GM
+H15        D172       10    PROS, CED, YW, ME, HPG, CEM, STAY, YG, HB, GM
+H59        9191G      10    PROS, CED, BW, DMI, HPG, CEM, STAY, Marb, HB, GM
+H31        9191G      10    PROS, CED, BW, DMI, HPG, CEM, STAY, Marb, HB, GM
+H70        Z124G      10    PROS, CED, DMI, STAY, Marb, YG, REA, FAT, HB, GM
+J62        1181J      10    PROS, CED, WW, YW, CEM, Marb, CW, FAT, HB, GM
+K60        8269       10    CED, BW, DMI, Milk, ME, STAY, Marb, YG, FAT, HB
+K51        1181J      10    PROS, CED, YW, CEM, STAY, Marb, CW, FAT, HB, GM
+K38B       D172       10    PROS, WW, YW, HPG, CEM, STAY, Marb, YG, HB, GM
+K86        1181J      10    PROS, CED, WW, YW, STAY, Marb, CW, FAT, HB, GM
+K34        D172       10    PROS, WW, YW, HPG, CEM, STAY, Marb, YG, HB, GM
+K52        9191G      10    PROS, CED, BW, DMI, HPG, CEM, Marb, YG, REA, GM
+K40        D172       10    PROS, CED, BW, ME, HPG, CEM, Marb, YG, HB, GM
+L31        D172       10    PROS, YW, HPG, CEM, Marb, YG, REA, FAT, HB, GM
+L32        1181J      10    PROS, CED, WW, YW, ADG, CEM, Marb, CW, FAT, GM
+L78        Z124G      10    CED, BW, DMI, Milk, CEM, Marb, YG, REA, FAT, GM
+D29        Z124G      9     PROS, CED, DMI, STAY, Marb, YG, REA, FAT, GM
+J10        1181J      9     PROS, CED, BW, DMI, STAY, Marb, CW, FAT, GM
+K59        8269       9     CED, BW, DMI, Milk, ME, CEM, Marb, YG, HB
+K21        9191G      9     PROS, CED, BW, DMI, HPG, CEM, Marb, HB, GM
+K25        8269       9     CED, BW, DMI, Milk, ME, STAY, Marb, YG, HB
+K75        1181J      8     PROS, CED, YW, DMI, Marb, CW, FAT, GM
+K43        8269       8     CED, BW, DMI, ME, STAY, Marb, YG, HB
+K87        1181J      8     PROS, WW, YW, STAY, Marb, CW, FAT, GM

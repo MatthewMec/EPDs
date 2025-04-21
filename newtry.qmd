@@ -1,0 +1,590 @@
+```{python}
+from ortools.sat.python import cp_model
+import pandas as pd
+import polars as pl
+offspring_epds = pl.read_csv('2025cow.csv')
+target_values = {
+                'CED': 14, 'BW': -3, 'WW': 65, 'YW': 100, 'ADG': 0.28,
+                'DMI': 0.6, 'Milk': 29, 'ME': -2, 'HPG': 12, 'CEM': 8,
+                'STAY': 18, 'Marb': 0.5, 'YG': 0.03, 'CW': 29, 'REA': 0.17,
+                'FAT': 0, 'HB': 70, 'GM': 46
+            }
+def create_epd_model_from_offspring(offspring_epds: pl.DataFrame, target_values: dict):
+    model = cp_model.CpModel()
+
+    # Identify EPD traits
+    ignore_columns = {"AnimalID", "RAAA#", "Sex", "Name", "DOB", "BrdCds"}
+    epd_traits = [col for col in offspring_epds.columns if col not in ignore_columns]
+    
+    # Define traits that should be minimized
+    minimize_traits = ['ME', 'BW', 'YG', 'DMI', 'FAT']
+    maximize_traits = [trait for trait in epd_traits if trait not in minimize_traits]
+
+    # Normalize traits to 0-1 scale
+    for trait in epd_traits:
+        min_val = offspring_epds.select(trait).min()[0, 0]
+        max_val = offspring_epds.select(trait).max()[0, 0]
+        if max_val - min_val != 0:
+            offspring_epds = offspring_epds.with_columns(
+                ((pl.col(trait) - min_val) / (max_val - min_val)).alias(f"{trait}_scaled")
+            )
+        else:
+            offspring_epds = offspring_epds.with_columns(
+                (pl.lit(0.0)).alias(f"{trait}_scaled")
+            )
+
+    # Split AnimalID into CowID and BullID
+    df = offspring_epds.with_columns(
+        pl.col("AnimalID").str.split("-").alias("AnimalID_split")
+    ).with_columns(
+        pl.col("AnimalID_split").list.get(0).alias("CowID"),
+        pl.col("AnimalID_split").list.get(1).alias("BullID"),
+    ).drop("AnimalID_split")
+
+    # Build EPD dictionary and calculate direction-aware z-values
+    offspring_epds_dict = {}
+    all_pairings = []
+    
+    # Calculate z-values for each pairing
+    for row in df.to_dicts():
+        cow_id = row['CowID']
+        bull_id = row['BullID']
+        pair_id = f'{cow_id}-{bull_id}'
+        epd_values = {k: v for k, v in row.items() if k.endswith('_scaled')}
+        offspring_epds_dict[pair_id] = epd_values
+        
+        # Calculate direction-aware z-value for this pairing
+        z_value = 0
+        trait_contributions = {}  # For debugging/reporting
+        
+        for trait in epd_traits:
+            trait_value = row[trait]  # Use original (non-scaled) value
+            
+            # Determine if this trait should be minimized or maximized
+            should_minimize = trait in minimize_traits
+            
+            # Get target value direction if available, or use minimize/maximize direction
+            if trait in target_values:
+                # Use target value direction
+                target_direction = target_values[trait]
+            else:
+                # Use default direction based on minimize/maximize
+                target_direction = -1 if should_minimize else 1
+                
+            # Calculate trait contribution to z-value
+            # If minimizing: negative value is better (lower)
+            # If maximizing: positive value is better (higher)
+            trait_contribution = target_direction * trait_value
+            
+            # Track individual trait contributions
+            trait_contributions[trait] = trait_contribution
+            
+            # Add to total z-value
+            z_value += trait_contribution
+        
+        all_pairings.append({
+            'cow_id': cow_id,
+            'bull_id': bull_id,
+            'pair_id': pair_id,
+            'z_value': z_value,
+            'trait_contributions': trait_contributions
+        })
+    
+    # Sort pairings by z-value (higher is better)
+    all_pairings.sort(key=lambda x: x['z_value'], reverse=True)
+    
+    # Identify the top pairings based on z-values
+    elite_cutoff = 50  # Number of pairings to prioritize
+    elite_pairings = all_pairings[:elite_cutoff]
+    elite_pair_ids = {p['pair_id'] for p in elite_pairings}
+    
+    # Cow and Bull ID lists
+    cow_ids = df.select(pl.col("CowID").unique()).to_series().to_list()
+    bull_ids = df.select(pl.col("BullID").unique()).to_series().to_list()
+    
+    num_cows = len(cow_ids)
+    num_bulls = len(bull_ids)
+    max_bull_capacity = int(0.20 * num_cows)
+    min_bull_capacity = int(.075 * num_cows)
+
+    cow_index_map = {cow_id: i for i, cow_id in enumerate(cow_ids)}
+    bull_index_map = {bull_id: i for i, bull_id in enumerate(bull_ids)}
+
+    # Create pairing variables
+    pairing_vars = [model.NewIntVar(0, num_bulls - 1, f'cow_{cow_id}') for cow_id in cow_ids]
+
+    # Create elite pairing indicator variables
+    elite_pair_vars = {}
+    for i, cow_id in enumerate(cow_ids):
+        for j, bull_id in enumerate(bull_ids):
+            pair_id = f'{cow_id}-{bull_id}'
+            if pair_id in elite_pair_ids:
+                elite_pair_vars[(i, j)] = model.NewBoolVar(f"elite_pair_{i}_{j}")
+
+    # Constraint: Limit number of cows per bull
+    for j, bull_id in enumerate(bull_ids):
+        uses = [model.NewBoolVar(f"cow_{i}_uses_bull_{j}") for i in range(num_cows)]
+        for i in range(num_cows):
+            model.Add(pairing_vars[i] == j).OnlyEnforceIf(uses[i])
+            model.Add(pairing_vars[i] != j).OnlyEnforceIf(uses[i].Not())
+        model.Add(sum(uses) <= max_bull_capacity)
+        model.Add(sum(uses) >= min_bull_capacity)
+
+    # Count the number of elite pairings used
+    elite_pairing_count = []
+    for (i, j), var in elite_pair_vars.items():
+        use_var = model.NewBoolVar(f"is_cow_{i}_bull_{j}")
+        model.Add(pairing_vars[i] == j).OnlyEnforceIf(use_var)
+        model.Add(pairing_vars[i] != j).OnlyEnforceIf(use_var.Not())
+        
+        # This variable is 1 if this is an elite pairing AND it's used
+        model.AddBoolAnd([use_var]).OnlyEnforceIf(var)
+        model.AddBoolOr([use_var.Not()]).OnlyEnforceIf(var.Not())
+        
+        elite_pairing_count.append(var)
+    
+    # Constraint: Try to maximize the number of elite pairings (at least 40% of the top 50)
+    min_elite_pairings = int(0.05 * elite_cutoff)  # Use at least 40% of the identified elite pairings
+    model.Add(sum(elite_pairing_count) >= min_elite_pairings)
+
+    # Objective setup
+    scaled_epd_traits = [f"{trait}_scaled" for trait in epd_traits]
+    trait_weights = {f"{trait}_scaled": 1.2 if trait == "Milk" else 1.0 for trait in epd_traits}
+    
+    # Priority multiplier for elite pairings
+    elite_priority_multiplier = 3.0  # Higher priority for elite pairings
+
+    epd_weighted_sum_vars = []
+    for trait in scaled_epd_traits:
+        epd_weighted_sum_vars.append(model.NewIntVar(-100000, 100000, f'{trait}_sum'))
+
+    # Build expected trait values with elite prioritization
+    for trait_index, trait in enumerate(scaled_epd_traits):
+        sum_expr = []
+        for i, cow_id in enumerate(cow_ids):
+            for j, bull_id in enumerate(bull_ids):
+                pair_key = f'{cow_id}-{bull_id}'
+                epd_val = int(1000 * offspring_epds_dict.get(pair_key, {}).get(trait, 0))
+                
+                # Check if this is an elite pairing
+                is_elite = pair_key in elite_pair_ids
+                
+                bool_var = model.NewBoolVar(f"is_cow_{i}_bull_{j}")
+                model.Add(pairing_vars[i] == j).OnlyEnforceIf(bool_var)
+                model.Add(pairing_vars[i] != j).OnlyEnforceIf(bool_var.Not())
+                
+                # Apply priority multiplier for elite pairings
+                weight_multiplier = elite_priority_multiplier if is_elite else 1.0
+                weighted_epd_val = int(epd_val * weight_multiplier)
+                sum_expr.append(weighted_epd_val * bool_var)
+                
+        model.Add(epd_weighted_sum_vars[trait_index] == sum(sum_expr))
+
+    # Combine into objective expression
+    objective_terms = []
+    for trait_index, trait in enumerate(scaled_epd_traits):
+        weight = int(1000 * trait_weights.get(trait, 1.0))
+        raw = epd_weighted_sum_vars[trait_index]
+        trait_name = trait.replace('_scaled', '')
+        if trait_name in minimize_traits:
+            objective_terms.append(weight * raw)
+        else:
+            objective_terms.append(-weight * raw)
+
+    # Add a bonus term for using elite pairings
+    elite_bonus = model.NewIntVar(-100000, 100000, 'elite_bonus')
+    elite_bonus_weight = 10000  # Adjust as needed
+    model.Add(elite_bonus == -elite_bonus_weight * sum(elite_pairing_count))
+    objective_terms.append(elite_bonus)
+
+    model.Minimize(sum(objective_terms))
+    
+    # Store z-values and trait contributions for reporting
+    z_values = {p['pair_id']: p['z_value'] for p in all_pairings}
+    trait_contributions = {p['pair_id']: p['trait_contributions'] for p in all_pairings}
+    
+    return model, pairing_vars, cow_ids, bull_ids, elite_pair_ids, z_values, trait_contributions
+```
+
+```{python}
+model, pairing_vars, cow_ids, bull_ids, elite_pair_ids, z_values, trait_contributions = create_epd_model_from_offspring(offspring_epds, target_values)
+
+solver = cp_model.CpSolver()
+status = solver.Solve(model)
+
+if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
+    pairings = []
+    for i, cow_id in enumerate(cow_ids):
+        bull_index = solver.Value(pairing_vars[i])
+        bull_id = bull_ids[bull_index]
+        
+        pair_id = f"{cow_id}-{bull_id}"
+        is_elite = pair_id in elite_pair_ids
+        z_value = z_values.get(pair_id, 0)
+        
+        # Get trait contributions for this pairing if available
+        traits_detail = trait_contributions.get(pair_id, {})
+        
+        pairing_data = {
+            "CowID": cow_id, 
+            "BullID": bull_id,
+            "IsElitePairing": is_elite,
+            "Z_Value": z_value
+        }
+        
+        # Add individual trait contributions to the output
+        for trait, contribution in traits_detail.items():
+            pairing_data[f"{trait}_Contribution"] = contribution
+            
+        pairings.append(pairing_data)
+   
+    pairings_df = pl.DataFrame(pairings)
+    
+    # Sort by Z-value for better visibility
+    pairings_df = pairings_df.sort("Z_Value", descending=True)
+    
+    # Print some statistics about the solution
+    used_elite_count = pairings_df.filter(pl.col("IsElitePairing")).height
+    total_elite_count = len(elite_pair_ids)
+    
+    print(f"Solution uses {used_elite_count} out of {total_elite_count} elite pairings ({used_elite_count/total_elite_count:.1%})")
+    print(f"Average Z-value of selected pairings: {pairings_df['Z_Value'].mean():.2f}")
+    print(f"Average Z-value of elite pairings used: {pairings_df.filter(pl.col('IsElitePairing'))['Z_Value'].mean():.2f}")
+    
+    # Print the top 10 pairings by Z-value for review
+    print("\nTop 10 pairings by Z-value:")
+    for row in pairings_df.head(10).to_dicts():
+        print(f"Cow {row['CowID']} x Bull {row['BullID']}: Z-value = {row['Z_Value']:.2f} {'(Elite)' if row['IsElitePairing'] else ''}")
+    
+else:
+    print("No feasible solution found.")
+    pairings_df = pl.DataFrame(schema={"CowID": pl.Utf8, "BullID": pl.Utf8, "IsElitePairing": pl.Boolean, "Z_Value": pl.Float64})
+```
+
+```{python}
+
+model, pairing_vars, cow_ids, bull_ids = create_epd_model_from_offspring(offspring_epds, target_values)
+
+solver = cp_model.CpSolver()
+status = solver.Solve(model)
+
+
+if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
+    pairings = []
+    for i, cow_id in enumerate(cow_ids):
+        bull_index = solver.Value(pairing_vars[i])
+        bull_id = bull_ids[bull_index]
+        pairings.append({"CowID": cow_id, "BullID": bull_id})
+    
+    pairings_df = pl.DataFrame(pairings)
+else:
+    print("No feasible solution found.")
+    pairings_df = pl.DataFrame(schema={"CowID": pl.Utf8, "BullID": pl.Utf8})
+```
+
+```{python}
+print(pairings_df)
+
+```
+
+```{python}
+pairings_df.select([pl.col('BullID').value_counts(),])
+```
+
+```{python}
+pairings_df.write_csv("pairingswlowmilkandminbreeding.csv")
+
+```
+
+```{python}
+# Model with Target Value Weights
+def extract_pairings_df(pairing_vars, cow_ids, bull_ids, solver, offspring_epds):
+    pairing_data = []
+    for i, cow_id in enumerate(cow_ids):
+        bull_index = solver.Value(pairing_vars[i])
+        bull_id = bull_ids[bull_index]
+        pair_id = f"{cow_id}-{bull_id}"
+
+        # Get EPD traits (original, not scaled) for the selected pair
+        row = offspring_epds.filter(pl.col("AnimalID") == pair_id)
+        if row.is_empty():
+            continue  # skip missing data
+
+        traits = {k: row[0, k] for k in row.columns if k not in ["AnimalID", "RAAA#", "Sex", "Name", "DOB", "BrdCds"]}
+        pairing_data.append({
+            "CowID": cow_id,
+            "BullID": bull_id,
+            **traits
+        })
+
+    return pl.DataFrame(pairing_data)
+```
+
+```{python}
+    pairings_df = extract_pairings_df(pairing_vars, cow_ids, bull_ids, solver, offspring_epds)
+
+```
+
+```{python}
+pairings_df.write_csv('pairingswithelite.csv')
+```
+
+
+```{python}
+def create_epd_model_from_offspring(offspring_epds: pl.DataFrame, target_values: dict):
+    model = cp_model.CpModel()
+
+    # Identify EPD traits
+    ignore_columns = {"AnimalID", "RAAA#", "Sex", "Name", "DOB", "BrdCds"}
+    epd_traits = [col for col in offspring_epds.columns if col not in ignore_columns]
+    
+    # Define traits that should be minimized
+    minimize_traits = ['ME', 'BW', 'YG', 'DMI', 'FAT']
+
+    # Normalize traits to 0-1 scale
+    for trait in epd_traits:
+        min_val = offspring_epds.select(trait).min()[0, 0]
+        max_val = offspring_epds.select(trait).max()[0, 0]
+        if max_val - min_val != 0:
+            offspring_epds = offspring_epds.with_columns(
+                ((pl.col(trait) - min_val) / (max_val - min_val)).alias(f"{trait}_scaled")
+            )
+        else:
+            offspring_epds = offspring_epds.with_columns(
+                (pl.lit(0.0)).alias(f"{trait}_scaled")
+            )
+
+    # Split AnimalID into CowID and BullID
+    df = offspring_epds.with_columns(
+        pl.col("AnimalID").str.split("-").alias("AnimalID_split")
+    ).with_columns(
+        pl.col("AnimalID_split").list.get(0).alias("CowID"),
+        pl.col("AnimalID_split").list.get(1).alias("BullID"),
+    ).drop("AnimalID_split")
+
+    # Build EPD dictionary and count traits meeting target values
+    offspring_epds_dict = {}
+    all_pairings = []
+    
+    for row in df.to_dicts():
+        cow_id = row['CowID']
+        bull_id = row['BullID']
+        pair_id = f'{cow_id}-{bull_id}'
+        epd_values = {k: v for k, v in row.items() if k.endswith('_scaled')}
+        offspring_epds_dict[pair_id] = epd_values
+        
+        # Count traits meeting target values
+        traits_meeting_target = 0
+        trait_status = {}  # Track which traits meet targets
+        
+        for trait in epd_traits:
+            if trait in target_values:
+                # Get the trait value and target
+                trait_value = row[trait]  # Use original (non-scaled) value
+                target_direction = target_values[trait]
+                
+                # Check if the trait meets the target
+                meets_target = False
+                if trait in minimize_traits:
+                    # For minimize traits, value should be less than 0
+                    meets_target = trait_value < 0
+                else:
+                    # For maximize traits, value should be greater than 0
+                    meets_target = trait_value > 0
+                
+                # Different direction from target value changes the condition
+                if target_direction < 0:
+                    meets_target = not meets_target
+                
+                if meets_target:
+                    traits_meeting_target += 1
+                
+                trait_status[trait] = meets_target
+        
+        all_pairings.append({
+            'cow_id': cow_id,
+            'bull_id': bull_id,
+            'pair_id': pair_id,
+            'traits_meeting_target': traits_meeting_target,
+            'trait_status': trait_status
+        })
+    
+    # Sort pairings by number of traits meeting target (higher is better)
+    all_pairings.sort(key=lambda x: x['traits_meeting_target'], reverse=True)
+    
+    # Identify the top pairings
+    elite_cutoff = 50  # Number of pairings to prioritize
+    elite_pairings = all_pairings[:elite_cutoff]
+    elite_pair_ids = {p['pair_id'] for p in elite_pairings}
+    
+    # Cow and Bull ID lists
+    cow_ids = df.select(pl.col("CowID").unique()).to_series().to_list()
+    bull_ids = df.select(pl.col("BullID").unique()).to_series().to_list()
+    
+    num_cows = len(cow_ids)
+    num_bulls = len(bull_ids)
+    max_bull_capacity = int(0.20 * num_cows)
+    min_bull_capacity = int(.075 * num_cows)
+
+    # Create pairing variables
+    pairing_vars = [model.NewIntVar(0, num_bulls - 1, f'cow_{cow_id}') for cow_id in cow_ids]
+
+    # Create elite pairing indicator variables
+    elite_pair_vars = {}
+    for i, cow_id in enumerate(cow_ids):
+        for j, bull_id in enumerate(bull_ids):
+            pair_id = f'{cow_id}-{bull_id}'
+            if pair_id in elite_pair_ids:
+                elite_pair_vars[(i, j)] = model.NewBoolVar(f"elite_pair_{i}_{j}")
+
+    # Constraint: Limit number of cows per bull
+    for j, bull_id in enumerate(bull_ids):
+        uses = [model.NewBoolVar(f"cow_{i}_uses_bull_{j}") for i in range(num_cows)]
+        for i in range(num_cows):
+            model.Add(pairing_vars[i] == j).OnlyEnforceIf(uses[i])
+            model.Add(pairing_vars[i] != j).OnlyEnforceIf(uses[i].Not())
+        model.Add(sum(uses) <= max_bull_capacity)
+        model.Add(sum(uses) >= min_bull_capacity)
+
+    # Count the number of elite pairings used
+    elite_pairing_count = []
+    for (i, j), var in elite_pair_vars.items():
+        use_var = model.NewBoolVar(f"is_cow_{i}_bull_{j}")
+        model.Add(pairing_vars[i] == j).OnlyEnforceIf(use_var)
+        model.Add(pairing_vars[i] != j).OnlyEnforceIf(use_var.Not())
+        
+        # This variable is 1 if this is an elite pairing AND it's used
+        model.AddBoolAnd([use_var]).OnlyEnforceIf(var)
+        model.AddBoolOr([use_var.Not()]).OnlyEnforceIf(var.Not())
+        
+        elite_pairing_count.append(var)
+    
+    # Constraint: Try to maximize the number of elite pairings (at least 40% of the top 50)
+    min_elite_pairings = int(0.4 * elite_cutoff)  # Use at least 40% of the identified elite pairings
+    model.Add(sum(elite_pairing_count) >= min_elite_pairings)
+
+    # Objective setup
+    scaled_epd_traits = [f"{trait}_scaled" for trait in epd_traits]
+    trait_weights = {f"{trait}_scaled": 1.2 if trait == "Milk" else 1.0 for trait in epd_traits}
+    
+    # Priority multiplier for elite pairings
+    elite_priority_multiplier = 3.0  # Higher priority for elite pairings
+
+    epd_weighted_sum_vars = []
+    for trait in scaled_epd_traits:
+        epd_weighted_sum_vars.append(model.NewIntVar(-100000, 100000, f'{trait}_sum'))
+
+    # Build expected trait values with elite prioritization
+    for trait_index, trait in enumerate(scaled_epd_traits):
+        sum_expr = []
+        for i, cow_id in enumerate(cow_ids):
+            for j, bull_id in enumerate(bull_ids):
+                pair_key = f'{cow_id}-{bull_id}'
+                epd_val = int(1000 * offspring_epds_dict.get(pair_key, {}).get(trait, 0))
+                
+                # Check if this is an elite pairing
+                is_elite = pair_key in elite_pair_ids
+                
+                bool_var = model.NewBoolVar(f"is_cow_{i}_bull_{j}")
+                model.Add(pairing_vars[i] == j).OnlyEnforceIf(bool_var)
+                model.Add(pairing_vars[i] != j).OnlyEnforceIf(bool_var.Not())
+                
+                # Apply priority multiplier for elite pairings
+                weight_multiplier = elite_priority_multiplier if is_elite else 1.0
+                weighted_epd_val = int(epd_val * weight_multiplier)
+                sum_expr.append(weighted_epd_val * bool_var)
+                
+        model.Add(epd_weighted_sum_vars[trait_index] == sum(sum_expr))
+
+    # Combine into objective expression
+    objective_terms = []
+    for trait_index, trait in enumerate(scaled_epd_traits):
+        weight = int(1000 * trait_weights.get(trait, 1.0))
+        raw = epd_weighted_sum_vars[trait_index]
+        trait_name = trait.replace('_scaled', '')
+        if trait_name in minimize_traits:
+            objective_terms.append(weight * raw)
+        else:
+            objective_terms.append(-weight * raw)
+
+    # Add a bonus term for using elite pairings
+    elite_bonus = model.NewIntVar(-100000, 100000, 'elite_bonus')
+    elite_bonus_weight = 10000  # Adjust as needed
+    model.Add(elite_bonus == -elite_bonus_weight * sum(elite_pairing_count))
+    objective_terms.append(elite_bonus)
+
+    model.Minimize(sum(objective_terms))
+    
+    # Store data for reporting
+    traits_meeting_target_counts = {p['pair_id']: p['traits_meeting_target'] for p in all_pairings}
+    trait_status_dict = {p['pair_id']: p['trait_status'] for p in all_pairings}
+    
+    return model, pairing_vars, cow_ids, bull_ids, elite_pair_ids, traits_meeting_target_counts, trait_status_dict
+
+```
+
+```{python}
+#Target Value Output Option
+# Adjust the solver function for the target-based approach
+model, pairing_vars, cow_ids, bull_ids, elite_pair_ids, traits_meeting_target_counts, trait_status_dict = create_epd_model_from_offspring(offspring_epds, target_values)
+
+solver = cp_model.CpSolver()
+status = solver.Solve(model)
+
+if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
+    pairings = []
+    for i, cow_id in enumerate(cow_ids):
+        bull_index = solver.Value(pairing_vars[i])
+        bull_id = bull_ids[bull_index]
+        
+        pair_id = f"{cow_id}-{bull_id}"
+        is_elite = pair_id in elite_pair_ids
+        traits_meeting_target = traits_meeting_target_counts.get(pair_id, 0)
+        trait_status = trait_status_dict.get(pair_id, {})
+        
+        pairing_data = {
+            "CowID": cow_id, 
+            "BullID": bull_id,
+            "IsElitePairing": is_elite,
+            "TraitsMeetingTarget": traits_meeting_target
+        }
+        
+        # Add individual trait status to the output
+        for trait, meets_target in trait_status.items():
+            pairing_data[f"{trait}_MeetsTarget"] = meets_target
+            
+        pairings.append(pairing_data)
+   
+    pairings_df = pl.DataFrame(pairings)
+    
+    # Sort by number of traits meeting target for better visibility
+    pairings_df = pairings_df.sort("TraitsMeetingTarget", descending=True)
+    
+    # Print statistics about the solution
+    used_elite_count = pairings_df.filter(pl.col("IsElitePairing")).height
+    total_elite_count = len(elite_pair_ids)
+    
+    print(f"Solution uses {used_elite_count} out of {total_elite_count} elite pairings ({used_elite_count/total_elite_count:.1%})")
+    print(f"Average traits meeting target in selected pairings: {pairings_df['TraitsMeetingTarget'].mean():.2f}")
+    print(f"Average traits meeting target in elite pairings used: {pairings_df.filter(pl.col('IsElitePairing'))['TraitsMeetingTarget'].mean():.2f}")
+    
+    # Print the top 10 pairings by traits meeting target
+    print("\nTop 10 pairings by traits meeting target:")
+    for row in pairings_df.head(10).to_dicts():
+        print(f"Cow {row['CowID']} x Bull {row['BullID']}: {row['TraitsMeetingTarget']} traits meeting target {'(Elite)' if row['IsElitePairing'] else ''}")
+    
+    # Count total traits in target values
+    total_target_traits = len([t for t in trait_status_dict.values()][0]) if trait_status_dict else 0
+    print(f"\nTotal traits with targets: {total_target_traits}")
+    
+else:
+    print("No feasible solution found.")
+    pairings_df = pl.DataFrame(schema={"CowID": pl.Utf8, "BullID": pl.Utf8, "IsElitePairing": pl.Boolean, "TraitsMeetingTarget": pl.Int64})
+```
+
+
+
+```{python}
+
+
+```
